@@ -229,16 +229,17 @@ export class SearchService {
 
   async search(query: string, limit: number, lmStudioConfig: UpdateLmStudioSettingsInput): Promise<SearchResponse> {
     const start = Date.now();
+    const requestedCount = limit;
     const analysis = await analyzeQuery(query, lmStudioConfig);
     const requestedStrategy = getStrategy(analysis.type);
     const keywordSeed = analysis.type === 'simple' ? query : analysis.expandedQuery;
     const ftsQuery = sanitizeFtsQuery(keywordSeed);
     const strategy = !ftsQuery && requestedStrategy === 'fast' ? 'semantic' : requestedStrategy;
     const repositoryKeywordMatches = ftsQuery
-      ? this.catalogService.keywordSearchRepositories(ftsQuery, limit * 5)
+      ? this.catalogService.keywordSearchRepositories(ftsQuery, requestedCount * 5)
       : [];
     const chunkKeywordMatches = ftsQuery
-      ? this.catalogService.keywordSearchChunks(ftsQuery, limit * 10)
+      ? this.catalogService.keywordSearchChunks(ftsQuery, requestedCount * 10)
       : [];
 
     const scoreMap = new Map<number, RepositoryScore>();
@@ -261,7 +262,7 @@ export class SearchService {
       scoreMap.set(match.repositoryId, entry);
     }
 
-    const shouldRunVectorSearch = strategy !== 'fast' || scoreMap.size < Math.max(4, limit);
+    const shouldRunVectorSearch = strategy !== 'fast' || scoreMap.size < Math.max(4, requestedCount);
     let semanticEmbeddingMode: SemanticEmbeddingMode = 'raw-query';
     let hypotheticalDocumentUsed = false;
     if (shouldRunVectorSearch) {
@@ -271,7 +272,7 @@ export class SearchService {
       hypotheticalDocumentUsed = semanticRetrieval.hypotheticalDocumentUsed;
       const vectorMatches = this.catalogService.rankChunkVectors(
         semanticRetrieval.embedding,
-        strategy === 'fast' ? limit * 4 : limit * 12,
+        strategy === 'fast' ? requestedCount * 4 : requestedCount * 12,
         strategy === 'fast' ? 0.18 : 0.12,
       );
 
@@ -293,10 +294,10 @@ export class SearchService {
     const rankedEntries = Array.from(scoreMap.entries())
       .sort((left, right) => right[1].score - left[1].score);
 
-    const rerankCandidateLimit = Math.min(Math.max(limit, RERANK_TARGET_CANDIDATES), RERANK_MAX_CANDIDATES);
+    const rerankCandidateLimit = Math.min(Math.max(requestedCount, RERANK_TARGET_CANDIDATES), RERANK_MAX_CANDIDATES);
     const candidatePoolLimit = strategy === 'fast'
-      ? limit
-      : Math.max(limit, rerankCandidateLimit);
+      ? requestedCount
+      : Math.max(requestedCount, rerankCandidateLimit);
     const candidatePoolIds = rankedEntries
       .slice(0, candidatePoolLimit)
       .map(([repositoryId]) => repositoryId);

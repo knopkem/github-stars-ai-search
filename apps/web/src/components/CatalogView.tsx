@@ -132,7 +132,6 @@ export function CatalogView({
         onRealtimeFilter={handleRealtimeFilter}
         onClear={handleClear}
         isSearching={isLoading}
-        aiResultLimit={25}
       />
 
       {searchResponse && searchMetadata && (

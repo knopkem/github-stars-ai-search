@@ -87,7 +87,7 @@ export const updateLmStudioSettingsSchema = z.object({
 
 export const searchRequestSchema = z.object({
   query: z.string().trim().min(1),
-  limit: z.number().int().min(1).max(100).optional().default(25),
+  limit: z.number().int().min(1).max(10_000).optional().default(1_000),
 });
 
 export const searchResultSchema = z.object({

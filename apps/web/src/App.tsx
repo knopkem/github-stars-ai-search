@@ -37,8 +37,6 @@ type BannerState = {
   message: string;
 } | null;
 
-const AI_SEARCH_LIMIT = 25;
-
 function getErrorMessage(error: unknown, fallback = 'Request failed.'): string {
   if (error instanceof Error && error.message.trim()) {
     return error.message;
@@ -564,7 +562,7 @@ function App() {
                   setLatestSearch(null);
                   return;
                 }
-                searchMutation.mutate({ query, limit: AI_SEARCH_LIMIT });
+                searchMutation.mutate({ query, limit: Math.max(repositories.length, 1) });
               }}
               onClearSearch={() => setLatestSearch(null)}
               onToggleWatchReleases={(repository, watchReleases) =>
