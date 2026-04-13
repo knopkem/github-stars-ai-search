@@ -2,6 +2,7 @@ import {
   repositoryPlatformSchema,
   type ReleaseRecord,
   type RepositoryRecord,
+  type SyncProgressPhase,
   type SyncSummary,
   type UpdateLmStudioSettingsInput,
 } from '@github-stars-ai-search/shared';
@@ -62,6 +63,10 @@ function toReleaseRecord(repositoryId: number, repositoryFullName: string, relea
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
+}
+
+function formatDiscoveryProgress(discoveredCount: number): string {
+  return `${discoveredCount} starred ${discoveredCount === 1 ? 'repository' : 'repositories'} discovered`;
 }
 
 function inferFacetsFallback(repository: RepositoryRecord): { summary: string; tags: string[]; platforms: string[] } {
@@ -127,7 +132,7 @@ Rules:
 }
 
 export interface SyncCallbacks {
-  onProgress?: (current: number, total: number, repository: string, phase: 'fetching' | 'indexing' | 'analyzing') => void;
+  onProgress?: (current: number, total: number, repository: string, phase: SyncProgressPhase) => void;
   signal?: AbortSignal;
 }
 
@@ -231,7 +236,14 @@ export class SyncService {
     const lmStudioClient = new LMStudioClient(lmStudioConfig);
     await lmStudioClient.testConnection();
 
-    const repositories = await githubClient.fetchStarredRepositories();
+    const repositories = await githubClient.fetchStarredRepositories(({ discoveredCount, estimatedTotalCount }) => {
+      callbacks?.onProgress?.(
+        discoveredCount,
+        estimatedTotalCount,
+        formatDiscoveryProgress(discoveredCount),
+        'discovering',
+      );
+    });
     const warnings: string[] = [];
     let indexedRepositoryCount = 0;
     let releaseCount = 0;

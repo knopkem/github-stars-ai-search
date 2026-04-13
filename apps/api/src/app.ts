@@ -8,6 +8,7 @@ import {
   exportPayloadSchema,
   healthSchema,
   searchRequestSchema,
+  type SyncProgressPhase,
   type SyncSummary,
   updateGitHubSettingsSchema,
   updateLmStudioSettingsSchema,
@@ -37,7 +38,7 @@ async function streamSyncEvents(
   reply: FastifyReply,
   run: (callbacks: {
     signal: AbortSignal;
-    onProgress: (current: number, total: number, repository: string, phase: 'fetching' | 'indexing' | 'analyzing') => void;
+    onProgress: (current: number, total: number, repository: string, phase: SyncProgressPhase) => void;
   }) => Promise<SyncSummary>,
 ) {
   const abortController = new AbortController();

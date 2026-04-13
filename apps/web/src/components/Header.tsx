@@ -1,3 +1,4 @@
+import type { SyncProgress } from '@github-stars-ai-search/shared';
 import {
   Search,
   Package,
@@ -15,7 +16,7 @@ interface HeaderProps {
   onChangeView: (view: View) => void;
   totalRepositories: number;
   isSyncing: boolean;
-  syncProgress: { current: number; total: number; repository: string; phase: string } | null;
+  syncProgress: SyncProgress | null;
   onSync: () => void;
   onCancelSync: () => void;
   lastSyncTime: string | null;

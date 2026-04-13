@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { RefreshCw } from 'lucide-react';
-import type { SearchResponse, SyncProgressEvent, SyncSummary } from '@github-stars-ai-search/shared';
+import type { SearchResponse, SyncProgress, SyncProgressEvent, SyncSummary } from '@github-stars-ai-search/shared';
 import {
   addAssetFilter,
   analyzeAll,
@@ -98,6 +98,19 @@ function extractSearchMetadata(response: SearchResponse | null) {
   };
 }
 
+function getSyncPhaseLabel(phase: SyncProgress['phase']): string {
+  switch (phase) {
+    case 'discovering':
+      return 'Discovering';
+    case 'fetching':
+      return 'Fetching';
+    case 'indexing':
+      return 'Indexing';
+    case 'analyzing':
+      return 'Analyzing';
+  }
+}
+
 function App() {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>('catalog');
@@ -132,14 +145,20 @@ function App() {
     queryFn: () => getStatsApi(),
   });
 
-  const [syncProgress, setSyncProgress] = useState<{ current: number; total: number; repository: string; phase: string } | null>(null);
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const syncAbortRef = useRef<AbortController | null>(null);
 
   const handleSync = useCallback(async () => {
     if (isSyncing) return;
     setIsSyncing(true);
-    setSyncProgress(null);
+    setSyncProgress({
+      type: 'progress',
+      current: 0,
+      total: 1,
+      repository: 'starred repositories',
+      phase: 'discovering',
+    });
     setBanner(null);
 
     const abortController = new AbortController();
@@ -150,9 +169,9 @@ function App() {
       const summary = await syncFullCatalog(
         (event: SyncProgressEvent) => {
           if (event.type === 'progress') {
-            setSyncProgress({ current: event.current, total: event.total, repository: event.repository, phase: event.phase });
+            setSyncProgress(event);
             // Refresh repo list every 10 repos so counts update live
-            if (event.current - lastRefresh >= 10) {
+            if (event.phase !== 'discovering' && event.current - lastRefresh >= 10) {
               lastRefresh = event.current;
               queryClient.invalidateQueries({ queryKey: ['repositories'] });
               queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -207,7 +226,7 @@ function App() {
       const summary = await analyzeFn(
         (event: SyncProgressEvent) => {
           if (event.type === 'progress') {
-            setSyncProgress({ current: event.current, total: event.total, repository: event.repository, phase: event.phase });
+            setSyncProgress(event);
             if (event.current - lastRefresh >= 10) {
               lastRefresh = event.current;
               queryClient.invalidateQueries({ queryKey: ['repositories'] });
@@ -407,9 +426,7 @@ function App() {
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between mb-1">
               <span className="text-text-secondary text-xs truncate">
-                {syncProgress.phase === 'fetching' && 'Fetching'}
-                {syncProgress.phase === 'indexing' && 'Indexing'}
-                {syncProgress.phase === 'analyzing' && 'Analyzing'}
+                {getSyncPhaseLabel(syncProgress.phase)}
                 {' '}
                 <span className="text-text-primary font-medium">{syncProgress.repository}</span>
               </span>

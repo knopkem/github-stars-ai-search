@@ -131,14 +131,18 @@ export const syncSummarySchema = z.object({
   warnings: z.array(z.string()),
 });
 
+export const syncProgressPhaseSchema = z.enum(['discovering', 'fetching', 'indexing', 'analyzing']);
+
+export const syncProgressSchema = z.object({
+  type: z.literal('progress'),
+  current: z.number().int().nonnegative(),
+  total: z.number().int().positive(),
+  repository: z.string(),
+  phase: syncProgressPhaseSchema,
+});
+
 export const syncProgressEventSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('progress'),
-    current: z.number().int(),
-    total: z.number().int(),
-    repository: z.string(),
-    phase: z.enum(['fetching', 'indexing', 'analyzing']),
-  }),
+  syncProgressSchema,
   z.object({
     type: z.literal('complete'),
     summary: syncSummarySchema,
@@ -238,6 +242,8 @@ export type SearchStrategy = z.infer<typeof searchStrategySchema>;
 export type QueryAnalysisType = z.infer<typeof queryAnalysisTypeSchema>;
 export type SearchMetadata = z.infer<typeof searchMetadataSchema>;
 export type SyncSummary = z.infer<typeof syncSummarySchema>;
+export type SyncProgressPhase = z.infer<typeof syncProgressPhaseSchema>;
+export type SyncProgress = z.infer<typeof syncProgressSchema>;
 export type SyncProgressEvent = z.infer<typeof syncProgressEventSchema>;
 export type ExportPayload = z.infer<typeof exportPayloadSchema>;
 export type LmStudioModelsResponse = z.infer<typeof lmStudioModelsResponseSchema>;
