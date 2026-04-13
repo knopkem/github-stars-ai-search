@@ -59,7 +59,7 @@ function getAbortedSyncSummary(): SyncSummary {
   };
 }
 
-class SyncRequestError extends Error {
+export class SyncRequestError extends Error {
   readonly retryable: boolean;
 
   constructor(
@@ -280,15 +280,19 @@ function streamSync(
           return getAbortedSyncSummary();
         }
 
-        if (!(error instanceof SyncRequestError) || !error.retryable || attempt >= SYNC_RETRY_DELAYS_MS.length) {
-          throw new Error(getErrorMessage(error, 'The sync request failed.'));
+        const syncError = error instanceof SyncRequestError
+          ? error
+          : new SyncRequestError(getErrorMessage(error, 'The sync request failed.'));
+
+        if (!syncError.retryable || attempt >= SYNC_RETRY_DELAYS_MS.length) {
+          throw syncError;
         }
 
         await wait(SYNC_RETRY_DELAYS_MS[attempt] ?? 0, signal);
       }
     }
 
-    throw new Error('The sync request failed.');
+    throw new SyncRequestError('The sync request failed.', true);
   })();
 }
 

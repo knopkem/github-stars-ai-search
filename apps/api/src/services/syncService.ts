@@ -50,6 +50,7 @@ function toRepositoryRecord(
     tags: existingRepository?.tags ?? [],
     platforms: existingRepository?.platforms ?? [],
     watchReleases: existingRepository?.watchReleases ?? false,
+    needsRefresh: existingRepository?.needsRefresh ?? false,
     indexedAt: existingRepository?.indexedAt ?? null,
   };
 }
@@ -477,6 +478,7 @@ export class SyncService {
         let needsRefresh = forceReindex
           || !existingRepository
           || existingRepository.indexedAt === null
+          || existingRepository.needsRefresh
           || existingRepository.pushedAt !== (repository.pushed_at ?? null)
           || (existingRepository !== null && hasMeaningfulRepositoryChange(existingRepository, repository));
 

@@ -76,6 +76,7 @@ function createRepositoryRecord(id: number, overrides: Partial<RepositoryRecord>
     tags: [],
     platforms: [],
     watchReleases: false,
+    needsRefresh: false,
     indexedAt: null,
     ...overrides,
   };
@@ -317,5 +318,36 @@ describe('SyncService', () => {
     expect(catalogService.markRepositoriesStale).toHaveBeenCalledWith([1]);
     expect(catalogService.replaceDocumentsAndChunks).toHaveBeenCalledWith(1, expect.any(Array), expect.any(Array));
     expect(lmStudioState.testConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes repositories that remain marked pending even when indexed data already exists', async () => {
+    const existingRepository = createRepositoryRecord(1, {
+      summary: 'Current summary',
+      tags: ['stable'],
+      platforms: ['web'],
+      needsRefresh: true,
+      indexedAt: '2024-01-05T00:00:00Z',
+    });
+
+    githubState.fetchStarredRepositories.mockResolvedValue([
+      createStarredRepository(existingRepository),
+    ]);
+    githubState.fetchReleasesResult.mockResolvedValue({
+      ok: true,
+      releases: [createGitHubRelease(101)],
+    });
+
+    const catalogService = createCatalogService({
+      listRepositories: vi.fn().mockReturnValue([existingRepository]),
+      listReleases: vi.fn().mockReturnValue([createReleaseRecord(1, 101)]),
+    });
+    const settingsService = createSettingsService();
+
+    const syncService = new SyncService(settingsService, catalogService);
+    const summary = await syncService.syncFullCatalog();
+
+    expect(summary.indexedRepositoryCount).toBe(1);
+    expect(catalogService.markRepositoriesStale).toHaveBeenCalledWith([1]);
+    expect(catalogService.replaceDocumentsAndChunks).toHaveBeenCalledWith(1, expect.any(Array), expect.any(Array));
   });
 });

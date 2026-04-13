@@ -38,6 +38,7 @@ function createRepository(id: number): RepositoryRecord {
     tags: [],
     platforms: [],
     watchReleases: false,
+    needsRefresh: false,
     indexedAt: '2024-01-03T00:00:00Z',
   };
 }

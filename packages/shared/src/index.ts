@@ -29,6 +29,7 @@ export const repositorySchema = z.object({
   tags: z.array(z.string()),
   platforms: z.array(repositoryPlatformSchema),
   watchReleases: z.boolean(),
+  needsRefresh: z.boolean().default(false),
   indexedAt: z.string().nullable(),
 });
 

@@ -42,6 +42,7 @@ async function streamSyncEvents(
     onProgress: (current: number, total: number, repository: string, phase: SyncProgressPhase) => void;
   }) => Promise<SyncSummary>,
 ) {
+  const heartbeatIntervalMs = 10_000;
   const abortController = new AbortController();
   const abortOnDisconnect = () => {
     if (!reply.raw.writableEnded) {
@@ -58,6 +59,11 @@ async function streamSyncEvents(
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
+  const heartbeatId = setInterval(() => {
+    if (!reply.raw.writableEnded) {
+      reply.raw.write(': keep-alive\n\n');
+    }
+  }, heartbeatIntervalMs);
 
   const send = (event: string, data: unknown) => {
     if (!reply.raw.writableEnded) {
@@ -83,6 +89,7 @@ async function streamSyncEvents(
       send('error', { type: 'error', message: getErrorMessage(error) });
     }
   } finally {
+    clearInterval(heartbeatId);
     request.raw.off('aborted', abortOnDisconnect);
     reply.raw.off('close', abortOnDisconnect);
     if (!reply.raw.writableEnded) {

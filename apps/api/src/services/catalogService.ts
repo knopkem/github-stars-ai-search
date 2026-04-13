@@ -38,6 +38,7 @@ function repositoryFromRow(row: RepositoryRow): RepositoryRecord {
     tags: parseJsonArray<string>(row.tags_json),
     platforms: parseJsonArray<RepositoryRecord['platforms'][number]>(row.platforms_json),
     watchReleases: !!row.watch_releases,
+    needsRefresh: !!row.needs_refresh,
     indexedAt: row.indexed_at,
   };
 }
@@ -188,8 +189,8 @@ export class CatalogService {
     this.db.prepare(`
       INSERT INTO repositories (
         id, full_name, name, owner_login, owner_avatar_url, description, html_url, stargazer_count, language, topics_json,
-        default_branch, pushed_at, starred_at, summary, tags_json, platforms_json, watch_releases, indexed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        default_branch, pushed_at, starred_at, summary, tags_json, platforms_json, watch_releases, needs_refresh, indexed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         full_name = excluded.full_name,
         name = excluded.name,
@@ -206,6 +207,7 @@ export class CatalogService {
         summary = excluded.summary,
         tags_json = excluded.tags_json,
         platforms_json = excluded.platforms_json,
+        needs_refresh = excluded.needs_refresh,
         indexed_at = excluded.indexed_at
     `).run(
       repository.id,
@@ -225,6 +227,7 @@ export class CatalogService {
       JSON.stringify(repository.tags),
       JSON.stringify(repository.platforms),
       repository.watchReleases ? 1 : 0,
+      repository.needsRefresh ? 1 : 0,
       repository.indexedAt,
     );
 
@@ -351,7 +354,7 @@ export class CatalogService {
   updateFacets(repositoryId: number, summary: string, tags: string[], platforms: string[], indexedAt: string): void {
     this.db.prepare(`
       UPDATE repositories
-      SET summary = ?, tags_json = ?, platforms_json = ?, indexed_at = ?
+      SET summary = ?, tags_json = ?, platforms_json = ?, needs_refresh = 0, indexed_at = ?
       WHERE id = ?
     `).run(summary, JSON.stringify(tags), JSON.stringify(platforms), indexedAt, repositoryId);
 
@@ -551,7 +554,9 @@ export class CatalogService {
   }
 
   getUnanalyzedRepositoryIds(): number[] {
-    const rows = typedRows<{ id: number }>(this.db.prepare('SELECT id FROM repositories WHERE indexed_at IS NULL').all());
+    const rows = typedRows<{ id: number }>(
+      this.db.prepare('SELECT id FROM repositories WHERE indexed_at IS NULL OR needs_refresh = 1').all(),
+    );
     return rows.map((r) => r.id);
   }
 
@@ -563,7 +568,7 @@ export class CatalogService {
   markRepositoriesStale(repositoryIds: number[]): void {
     if (repositoryIds.length === 0) return;
     const placeholders = repositoryIds.map(() => '?').join(',');
-    this.db.prepare(`UPDATE repositories SET indexed_at = NULL WHERE id IN (${placeholders})`).run(...repositoryIds);
+    this.db.prepare(`UPDATE repositories SET needs_refresh = 1 WHERE id IN (${placeholders})`).run(...repositoryIds);
   }
 
   resetAnalysisForRepositories(repositoryIds: number[]): void {
@@ -572,7 +577,11 @@ export class CatalogService {
     this.db.prepare(`DELETE FROM chunk_fts WHERE rowid IN (SELECT id FROM chunks WHERE repository_id IN (${placeholders}))`).run(...repositoryIds);
     this.db.prepare(`DELETE FROM chunks WHERE repository_id IN (${placeholders})`).run(...repositoryIds);
     this.db.prepare(`DELETE FROM documents WHERE repository_id IN (${placeholders})`).run(...repositoryIds);
-    this.db.prepare(`UPDATE repositories SET indexed_at = NULL, summary = NULL, tags_json = '[]', platforms_json = '[]' WHERE id IN (${placeholders})`).run(...repositoryIds);
+    this.db.prepare(`
+      UPDATE repositories
+      SET indexed_at = NULL, summary = NULL, tags_json = '[]', platforms_json = '[]', needs_refresh = 1
+      WHERE id IN (${placeholders})
+    `).run(...repositoryIds);
     this.invalidateChunkCaches();
   }
 

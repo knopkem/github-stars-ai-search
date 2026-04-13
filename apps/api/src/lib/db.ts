@@ -19,6 +19,7 @@ export interface RepositoryRow {
   tags_json: string;
   platforms_json: string;
   watch_releases: number;
+  needs_refresh: number;
   indexed_at: string | null;
 }
 
@@ -85,6 +86,7 @@ export function createDatabase(config: AppConfig): DatabaseSync {
       tags_json TEXT NOT NULL DEFAULT '[]',
       platforms_json TEXT NOT NULL DEFAULT '[]',
       watch_releases INTEGER NOT NULL DEFAULT 0,
+      needs_refresh INTEGER NOT NULL DEFAULT 0,
       indexed_at TEXT
     );
 
@@ -163,6 +165,13 @@ export function createDatabase(config: AppConfig): DatabaseSync {
     db.exec(`ALTER TABLE repositories DROP COLUMN _watch_migration_done`);
   } catch {
     // Migration already ran
+  }
+
+  // Migration: track pending refresh separately from successful indexing
+  try {
+    db.exec(`ALTER TABLE repositories ADD COLUMN needs_refresh INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    // Column already exists — ignore
   }
 
   return db;

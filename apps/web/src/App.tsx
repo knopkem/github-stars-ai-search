@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { RefreshCw } from 'lucide-react';
-import type { SearchResponse, SyncProgress, SyncProgressEvent, SyncSummary } from '@github-stars-ai-search/shared';
+import type { RepositoryRecord, SearchResponse, SyncProgress, SyncProgressEvent, SyncSummary } from '@github-stars-ai-search/shared';
 import {
   addAssetFilter,
   analyzeRemaining,
@@ -17,6 +17,7 @@ import {
   saveGitHubSettings,
   saveLmStudioSettings,
   searchCatalog,
+  SyncRequestError,
   syncFullCatalog,
   testGitHubSettings,
   toggleWatchReleases,
@@ -36,6 +37,8 @@ type BannerState = {
   tone: 'success' | 'error' | 'info';
   message: string;
 } | null;
+
+const SYNC_RESUME_DELAYS_MS = [1_500, 3_000, 5_000];
 
 function getErrorMessage(error: unknown, fallback = 'Request failed.'): string {
   if (error instanceof Error && error.message.trim()) {
@@ -110,29 +113,79 @@ function getSyncPhaseLabel(phase: SyncProgress['phase']): string {
   }
 }
 
-function getIncrementalSyncMessage(summary: SyncSummary, aborted: boolean): string {
+function countPendingRepositories(repositories: RepositoryRecord[]): number {
+  return repositories.filter((repository) => repository.indexedAt === null || repository.needsRefresh).length;
+}
+
+function waitForResume(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+
+    const onAbort = () => {
+      window.clearTimeout(timeoutId);
+      resolve();
+    };
+
+    const timeoutId = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function createSyncSummary(
+  repositoryCount: number,
+  indexedRepositoryCount: number,
+  chunkCount = 0,
+  releaseCount = 0,
+  warnings: string[] = [],
+): SyncSummary {
+  return {
+    repositoryCount,
+    indexedRepositoryCount,
+    chunkCount,
+    releaseCount,
+    warnings,
+  };
+}
+
+function getIncrementalSyncMessage(summary: SyncSummary, aborted: boolean, resumed = false): string {
   if (aborted) {
     return `Sync cancelled after updating ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
   }
   if (summary.indexedRepositoryCount === 0) {
     return 'Catalog is already up to date.';
   }
+  if (resumed) {
+    return `Updated ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories after reconnecting.`;
+  }
   return `Updated ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories and ${summary.chunkCount} chunks.`;
 }
 
-function getPendingRefreshMessage(summary: SyncSummary, aborted: boolean): string {
+function getPendingRefreshMessage(summary: SyncSummary, aborted: boolean, resumed = false): string {
   if (aborted) {
     return `Refresh cancelled after ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
   }
   if (summary.indexedRepositoryCount === 0) {
     return 'No repositories are pending refresh.';
   }
+  if (resumed) {
+    return `Refreshed ${summary.indexedRepositoryCount}/${summary.repositoryCount} pending repositories after reconnecting.`;
+  }
   return `Refreshed ${summary.indexedRepositoryCount}/${summary.repositoryCount} pending repositories (${summary.chunkCount} chunks).`;
 }
 
-function getRebuildMessage(summary: SyncSummary, aborted: boolean): string {
+function getRebuildMessage(summary: SyncSummary, aborted: boolean, resumed = false): string {
   if (aborted) {
     return `Rebuild cancelled after refreshing ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
+  }
+  if (resumed) {
+    return `Rebuilt ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories after reconnecting.`;
   }
   return `Rebuilt ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories and ${summary.chunkCount} chunks.`;
 }
@@ -194,6 +247,147 @@ function App() {
     setToasts((current) => [...current, { id: toastId, tone: toastTone, message: feedback.message }]);
   }, []);
 
+  const invalidateCatalogQueries = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['repositories'] }),
+      queryClient.invalidateQueries({ queryKey: ['releases'] }),
+      queryClient.invalidateQueries({ queryKey: ['stats'] }),
+    ]);
+  }, [queryClient]);
+
+  const refreshRepositorySnapshot = useCallback(async (): Promise<RepositoryRecord[]> => {
+    const response = await getRepositories();
+    queryClient.setQueryData(['repositories'], response);
+    return response.repositories;
+  }, [queryClient]);
+
+  const runPendingRefreshQueue = useCallback(async ({
+    totalPending,
+    initialPending,
+    abortController,
+    resumeLabel,
+  }: {
+    totalPending: number;
+    initialPending: number;
+    abortController: AbortController;
+    resumeLabel: string;
+  }): Promise<{ summary: SyncSummary; resumed: boolean; totalRepositories: number }> => {
+    let pendingBeforeAttempt = initialPending;
+    let resumed = initialPending < totalPending;
+    let resumeAttempt = 0;
+    let chunkCount = 0;
+    let releaseCount = 0;
+    const warnings: string[] = [];
+    let lastRefresh = totalPending - initialPending;
+
+    if (totalPending > 0) {
+      setSyncProgress({
+        type: 'progress',
+        current: Math.max(0, totalPending - initialPending),
+        total: totalPending,
+        repository: initialPending === totalPending ? 'pending repositories' : `${initialPending} repositories remaining`,
+        phase: 'analyzing',
+      });
+    }
+
+    while (true) {
+      try {
+        const summary = await analyzeRemaining(
+          (event: SyncProgressEvent) => {
+            if (event.type !== 'progress') {
+              return;
+            }
+
+            const normalizedCurrent = Math.min(totalPending, totalPending - pendingBeforeAttempt + event.current);
+            setSyncProgress({
+              ...event,
+              current: normalizedCurrent,
+              total: totalPending,
+            });
+
+            if (normalizedCurrent - lastRefresh >= 10) {
+              lastRefresh = normalizedCurrent;
+              queryClient.invalidateQueries({ queryKey: ['repositories'] });
+              queryClient.invalidateQueries({ queryKey: ['stats'] });
+            }
+          },
+          abortController.signal,
+        );
+
+        chunkCount += summary.chunkCount;
+        releaseCount += summary.releaseCount;
+        warnings.push(...summary.warnings);
+
+        const repositories = await refreshRepositorySnapshot();
+        const remainingPending = countPendingRepositories(repositories);
+
+        return {
+          summary: createSyncSummary(
+            totalPending,
+            Math.max(0, totalPending - remainingPending),
+            chunkCount,
+            releaseCount,
+            warnings,
+          ),
+          resumed,
+          totalRepositories: repositories.length,
+        };
+      } catch (error) {
+        const repositories = await refreshRepositorySnapshot().catch(() => null);
+        const remainingPending = repositories ? countPendingRepositories(repositories) : pendingBeforeAttempt;
+
+        if (abortController.signal.aborted) {
+          return {
+            summary: createSyncSummary(
+              totalPending,
+              Math.max(0, totalPending - remainingPending),
+              chunkCount,
+              releaseCount,
+              warnings,
+            ),
+            resumed,
+            totalRepositories: repositories?.length ?? 0,
+          };
+        }
+
+        if (repositories && remainingPending === 0) {
+          return {
+            summary: createSyncSummary(totalPending, totalPending, chunkCount, releaseCount, warnings),
+            resumed: true,
+            totalRepositories: repositories.length,
+          };
+        }
+
+        const madeProgress = repositories !== null && remainingPending < pendingBeforeAttempt;
+        if (
+          !(error instanceof SyncRequestError)
+          || !error.retryable
+          || repositories === null
+          || remainingPending <= 0
+          || resumeAttempt >= SYNC_RESUME_DELAYS_MS.length
+          || (!madeProgress && remainingPending >= pendingBeforeAttempt)
+        ) {
+          throw error;
+        }
+
+        resumed = true;
+        pendingBeforeAttempt = remainingPending;
+        setSyncProgress({
+          type: 'progress',
+          current: Math.max(0, totalPending - remainingPending),
+          total: totalPending,
+          repository: `${remainingPending} repositories remaining`,
+          phase: 'analyzing',
+        });
+        showFeedback({ tone: 'info', message: `${resumeLabel} Resuming ${remainingPending} remaining repositories...` });
+
+        const delay = SYNC_RESUME_DELAYS_MS[resumeAttempt] ?? 0;
+        resumeAttempt += 1;
+        await waitForResume(delay, abortController.signal);
+      }
+    }
+  }, [queryClient, refreshRepositorySnapshot, showFeedback]);
+
   const handleSync = useCallback(async () => {
     if (isSyncing) return;
     setIsSyncing(true);
@@ -209,12 +403,17 @@ function App() {
     const abortController = new AbortController();
     syncAbortRef.current = abortController;
     let lastRefresh = 0;
+    let refreshQueueTotal: number | null = null;
+    let resumedAfterReconnect = false;
 
     try {
-      const summary = await syncFullCatalog(
+      let summary = await syncFullCatalog(
         (event: SyncProgressEvent) => {
           if (event.type === 'progress') {
             setSyncProgress(event);
+            if (event.phase !== 'discovering') {
+              refreshQueueTotal = event.total;
+            }
             // Refresh repo list every 10 repos so counts update live
             if (event.phase !== 'discovering' && event.current - lastRefresh >= 10) {
               lastRefresh = event.current;
@@ -226,20 +425,57 @@ function App() {
         abortController.signal,
       );
 
+      if (summary.warnings.length === 0 && refreshQueueTotal !== null) {
+        const repositories = await refreshRepositorySnapshot().catch(() => null);
+        if (repositories) {
+          summary = {
+            ...summary,
+            indexedRepositoryCount: Math.max(0, refreshQueueTotal - countPendingRepositories(repositories)),
+          };
+        }
+      }
+
       setLastSyncSummary(summary);
       setLastSyncTime(new Date().toISOString());
       showFeedback({
         tone: abortController.signal.aborted
           ? 'info'
           : summary.warnings.length > 0 ? 'info' : 'success',
-        message: getIncrementalSyncMessage(summary, abortController.signal.aborted),
+        message: getIncrementalSyncMessage(summary, abortController.signal.aborted, resumedAfterReconnect),
       });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['repositories'] }),
-        queryClient.invalidateQueries({ queryKey: ['releases'] }),
-        queryClient.invalidateQueries({ queryKey: ['stats'] }),
-      ]);
+      await invalidateCatalogQueries();
     } catch (error) {
+      if (!abortController.signal.aborted && error instanceof SyncRequestError && error.retryable && refreshQueueTotal !== null) {
+        const repositories = await refreshRepositorySnapshot().catch(() => null);
+        const remainingPending = repositories ? countPendingRepositories(repositories) : refreshQueueTotal;
+
+        if (remainingPending >= 0 && repositories) {
+          const resumed = await runPendingRefreshQueue({
+            totalPending: refreshQueueTotal,
+            initialPending: remainingPending,
+            abortController,
+            resumeLabel: 'Sync connection dropped.',
+          });
+
+          const resumedSummary: SyncSummary = {
+            ...resumed.summary,
+            repositoryCount: resumed.totalRepositories,
+          };
+
+          resumedAfterReconnect = resumed.resumed;
+          setLastSyncSummary(resumedSummary);
+          setLastSyncTime(new Date().toISOString());
+          showFeedback({
+            tone: abortController.signal.aborted
+              ? 'info'
+              : resumedSummary.warnings.length > 0 ? 'info' : 'success',
+            message: getIncrementalSyncMessage(resumedSummary, abortController.signal.aborted, resumedAfterReconnect),
+          });
+          await invalidateCatalogQueries();
+          return;
+        }
+      }
+
       if (!abortController.signal.aborted) {
         showFeedback({ tone: 'error', message: getErrorMessage(error) });
       }
@@ -248,7 +484,7 @@ function App() {
       setSyncProgress(null);
       syncAbortRef.current = null;
     }
-  }, [isSyncing, queryClient, showFeedback]);
+  }, [invalidateCatalogQueries, isSyncing, queryClient, refreshRepositorySnapshot, runPendingRefreshQueue, showFeedback]);
 
   const handleCancelSync = useCallback(() => {
     syncAbortRef.current?.abort();
@@ -271,22 +507,56 @@ function App() {
     const abortController = new AbortController();
     syncAbortRef.current = abortController;
     let lastRefresh = 0;
-    const analyzeFn = mode === 'remaining' ? analyzeRemaining : rebuildFullCatalog;
+    let resumedAfterReconnect = false;
+    let refreshQueueTotal: number | null = null;
 
     try {
-      const summary = await analyzeFn(
-        (event: SyncProgressEvent) => {
-          if (event.type === 'progress') {
-            setSyncProgress(event);
-            if (event.current - lastRefresh >= 10) {
-              lastRefresh = event.current;
-              queryClient.invalidateQueries({ queryKey: ['repositories'] });
-              queryClient.invalidateQueries({ queryKey: ['stats'] });
+      let summary: SyncSummary;
+
+      if (mode === 'remaining') {
+        const repositories = await refreshRepositorySnapshot();
+        const pendingCount = countPendingRepositories(repositories);
+
+        if (pendingCount === 0) {
+          summary = createSyncSummary(0, 0);
+        } else {
+          const resumed = await runPendingRefreshQueue({
+            totalPending: pendingCount,
+            initialPending: pendingCount,
+            abortController,
+            resumeLabel: 'Refresh connection dropped.',
+          });
+          summary = resumed.summary;
+          resumedAfterReconnect = resumed.resumed;
+        }
+      } else {
+        summary = await rebuildFullCatalog(
+          (event: SyncProgressEvent) => {
+            if (event.type === 'progress') {
+              setSyncProgress(event);
+              if (event.phase !== 'discovering') {
+                refreshQueueTotal = event.total;
+              }
+              if (event.current - lastRefresh >= 10) {
+                lastRefresh = event.current;
+                queryClient.invalidateQueries({ queryKey: ['repositories'] });
+                queryClient.invalidateQueries({ queryKey: ['stats'] });
+              }
             }
+          },
+          abortController.signal,
+        );
+
+        if (refreshQueueTotal !== null) {
+          const repositories = await refreshRepositorySnapshot().catch(() => null);
+          if (repositories) {
+            summary = {
+              ...summary,
+              indexedRepositoryCount: Math.max(0, refreshQueueTotal - countPendingRepositories(repositories)),
+            };
           }
-        },
-        abortController.signal,
-      );
+        }
+      }
 
       setLastSyncSummary(summary);
       if (mode === 'rebuild') {
@@ -297,15 +567,42 @@ function App() {
           ? 'info'
           : summary.warnings.length > 0 ? 'info' : 'success',
         message: mode === 'remaining'
-          ? getPendingRefreshMessage(summary, abortController.signal.aborted)
-          : getRebuildMessage(summary, abortController.signal.aborted),
+          ? getPendingRefreshMessage(summary, abortController.signal.aborted, resumedAfterReconnect)
+          : getRebuildMessage(summary, abortController.signal.aborted, resumedAfterReconnect),
       });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['repositories'] }),
-        queryClient.invalidateQueries({ queryKey: ['releases'] }),
-        queryClient.invalidateQueries({ queryKey: ['stats'] }),
-      ]);
+      await invalidateCatalogQueries();
     } catch (error) {
+      if (!abortController.signal.aborted && mode === 'rebuild' && error instanceof SyncRequestError && error.retryable && refreshQueueTotal !== null) {
+        const repositories = await refreshRepositorySnapshot().catch(() => null);
+        const remainingPending = repositories ? countPendingRepositories(repositories) : refreshQueueTotal;
+
+        if (repositories) {
+          const resumed = await runPendingRefreshQueue({
+            totalPending: refreshQueueTotal,
+            initialPending: remainingPending,
+            abortController,
+            resumeLabel: 'Rebuild connection dropped.',
+          });
+
+          const resumedSummary: SyncSummary = {
+            ...resumed.summary,
+            repositoryCount: resumed.totalRepositories,
+          };
+
+          resumedAfterReconnect = resumed.resumed;
+          setLastSyncSummary(resumedSummary);
+          setLastSyncTime(new Date().toISOString());
+          showFeedback({
+            tone: abortController.signal.aborted
+              ? 'info'
+              : resumedSummary.warnings.length > 0 ? 'info' : 'success',
+            message: getRebuildMessage(resumedSummary, abortController.signal.aborted, resumedAfterReconnect),
+          });
+          await invalidateCatalogQueries();
+          return;
+        }
+      }
+
       if (!abortController.signal.aborted) {
         showFeedback({
           tone: 'error',
@@ -317,7 +614,7 @@ function App() {
       setSyncProgress(null);
       syncAbortRef.current = null;
     }
-  }, [isSyncing, queryClient, showFeedback]);
+  }, [invalidateCatalogQueries, isSyncing, queryClient, refreshRepositorySnapshot, runPendingRefreshQueue, showFeedback]);
 
   const searchMutation = useMutation({
     mutationFn: searchCatalog,
