@@ -38,6 +38,16 @@ type BannerState = {
 
 const AI_SEARCH_LIMIT = 25;
 
+function getErrorMessage(error: unknown, fallback = 'Request failed.'): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return fallback;
+}
+
 function extractSearchMetadata(response: SearchResponse | null) {
   if (!response) {
     return null;
@@ -169,7 +179,7 @@ function App() {
       ]);
     } catch (error) {
       if (!abortController.signal.aborted) {
-        setBanner({ tone: 'error', message: (error as Error).message });
+        setBanner({ tone: 'error', message: getErrorMessage(error) });
       }
     } finally {
       setIsSyncing(false);
@@ -223,7 +233,10 @@ function App() {
       ]);
     } catch (error) {
       if (!abortController.signal.aborted) {
-        setBanner({ tone: 'error', message: (error as Error).message });
+        setBanner({
+          tone: 'error',
+          message: `${mode === 'remaining' ? 'Rerun Remaining' : 'Rerun All'} failed: ${getErrorMessage(error)}`,
+        });
       }
     } finally {
       setIsSyncing(false);

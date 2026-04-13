@@ -8,6 +8,7 @@ import type {
   SyncProgressEvent,
   SyncSummary,
 } from '@github-stars-ai-search/shared';
+import { syncProgressEventSchema } from '@github-stars-ai-search/shared';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? '';
 
@@ -36,6 +37,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return fallback;
+}
+
+function getAbortedSyncSummary(): SyncSummary {
+  return {
+    repositoryCount: 0,
+    indexedRepositoryCount: 0,
+    releaseCount: 0,
+    chunkCount: 0,
+    warnings: [],
+  };
 }
 
 export function getSettings(): Promise<AppSettings> {
@@ -98,7 +119,49 @@ function streamSync(
   signal?: AbortSignal,
 ): Promise<SyncSummary> {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const url = `${API_BASE_URL}${path}`;
+    const settleResolve = (summary: SyncSummary) => {
+      if (settled) return;
+      settled = true;
+      resolve(summary);
+    };
+    const settleReject = (error: unknown, fallback: string) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(getErrorMessage(error, fallback)));
+    };
+    const processEventBlock = (block: string) => {
+      const lines = block
+        .split('\n')
+        .map((line) => line.trimEnd())
+        .filter(Boolean);
+      const dataLine = lines.find((line) => line.startsWith('data: '));
+      if (!dataLine) {
+        return;
+      }
+
+      let payload: unknown;
+      try {
+        payload = JSON.parse(dataLine.slice(6));
+      } catch (error) {
+        settleReject(error, 'Received an invalid sync event from the server.');
+        return;
+      }
+
+      const event = syncProgressEventSchema.safeParse(payload);
+      if (!event.success) {
+        settleReject('Received an invalid sync event from the server.', 'Received an invalid sync event from the server.');
+        return;
+      }
+
+      onEvent(event.data);
+      if (event.data.type === 'complete' || event.data.type === 'cancelled') {
+        settleResolve(event.data.summary);
+      } else if (event.data.type === 'error') {
+        settleReject(event.data.message, 'The sync request failed.');
+      }
+    };
 
     fetch(url, {
       method: 'POST',
@@ -119,7 +182,9 @@ function streamSync(
         }
 
         const reader = response.body?.getReader();
-        if (!reader) throw new Error('No response body');
+        if (!reader) {
+          throw new Error('No response body.');
+        }
 
         const decoder = new TextDecoder();
         let buffer = '';
@@ -128,33 +193,34 @@ function streamSync(
           const { done, value } = await reader.read();
           if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              // Event type prefix — data follows on next line
-            } else if (line.startsWith('data: ')) {
-              const data = JSON.parse(line.slice(6)) as SyncProgressEvent;
-              onEvent(data);
-              if (data.type === 'complete') {
-                resolve(data.summary);
-              } else if (data.type === 'cancelled') {
-                resolve(data.summary);
-              } else if (data.type === 'error') {
-                reject(new Error(data.message));
-              }
-            }
+          buffer += decoder.decode(value, { stream: true }).replace(/\r/g, '');
+          let boundaryIndex = buffer.indexOf('\n\n');
+          while (boundaryIndex >= 0) {
+            processEventBlock(buffer.slice(0, boundaryIndex));
+            buffer = buffer.slice(boundaryIndex + 2);
+            boundaryIndex = buffer.indexOf('\n\n');
           }
+        }
+
+        buffer += decoder.decode().replace(/\r/g, '');
+        if (buffer.trim()) {
+          processEventBlock(buffer);
+        }
+
+        if (!settled) {
+          if (signal?.aborted) {
+            settleResolve(getAbortedSyncSummary());
+            return;
+          }
+          settleReject('The server closed the sync stream before sending a final result.', 'The sync request ended unexpectedly.');
         }
       })
       .catch((error) => {
         if (signal?.aborted) {
-          resolve({ repositoryCount: 0, indexedRepositoryCount: 0, releaseCount: 0, chunkCount: 0, warnings: [] });
+          settleResolve(getAbortedSyncSummary());
           return;
         }
-        reject(error);
+        settleReject(error, 'The sync request failed.');
       });
   });
 }

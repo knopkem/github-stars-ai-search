@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -8,6 +8,7 @@ import {
   exportPayloadSchema,
   healthSchema,
   searchRequestSchema,
+  type SyncSummary,
   updateGitHubSettingsSchema,
   updateLmStudioSettingsSchema,
 } from '@github-stars-ai-search/shared';
@@ -20,6 +21,73 @@ import { CatalogService } from './services/catalogService.js';
 import { SearchService } from './services/searchService.js';
 import { SettingsService } from './services/settingsService.js';
 import { SyncService } from './services/syncService.js';
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return 'Unknown error.';
+}
+
+async function streamSyncEvents(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  run: (callbacks: {
+    signal: AbortSignal;
+    onProgress: (current: number, total: number, repository: string, phase: 'fetching' | 'indexing' | 'analyzing') => void;
+  }) => Promise<SyncSummary>,
+) {
+  const abortController = new AbortController();
+  const abortOnDisconnect = () => {
+    if (!reply.raw.writableEnded) {
+      abortController.abort();
+    }
+  };
+
+  request.raw.on('aborted', abortOnDisconnect);
+  reply.raw.on('close', abortOnDisconnect);
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const send = (event: string, data: unknown) => {
+    if (!reply.raw.writableEnded) {
+      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+  };
+
+  try {
+    const summary = await run({
+      signal: abortController.signal,
+      onProgress: (current, total, repository, phase) => {
+        send('progress', { type: 'progress', current, total, repository, phase });
+      },
+    });
+
+    if (abortController.signal.aborted) {
+      send('cancelled', { type: 'cancelled', summary });
+    } else {
+      send('complete', { type: 'complete', summary });
+    }
+  } catch (error) {
+    if (!abortController.signal.aborted) {
+      send('error', { type: 'error', message: getErrorMessage(error) });
+    }
+  } finally {
+    request.raw.off('aborted', abortOnDisconnect);
+    reply.raw.off('close', abortOnDisconnect);
+    if (!reply.raw.writableEnded) {
+      reply.raw.end();
+    }
+  }
+}
 
 export async function buildApp(masterKey: Buffer) {
   const config = loadConfig();
@@ -185,117 +253,24 @@ export async function buildApp(masterKey: Buffer) {
   });
 
   app.post('/api/sync/full', async (request, reply) => {
-    const abortController = new AbortController();
-
-    request.raw.on('close', () => {
-      abortController.abort();
-    });
-
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
-    const send = (event: string, data: unknown) => {
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
-
-    try {
-      const summary = await syncService.syncFullCatalog({
-        signal: abortController.signal,
-        onProgress: (current, total, repository, phase) => {
-          send('progress', { type: 'progress', current, total, repository, phase });
-        },
-      });
-
-      if (abortController.signal.aborted) {
-        send('cancelled', { type: 'cancelled', summary });
-      } else {
-        send('complete', { type: 'complete', summary });
-      }
-    } catch (error) {
-      send('error', { type: 'error', message: (error as Error).message });
-    }
-
-    reply.raw.end();
-    reply.hijack();
+    await streamSyncEvents(request, reply, ({ signal, onProgress }) =>
+      syncService.syncFullCatalog({ signal, onProgress }),
+    );
   });
 
   app.post('/api/sync/analyze-remaining', async (request, reply) => {
-    const abortController = new AbortController();
-    request.raw.on('close', () => { abortController.abort(); });
-
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
-    const send = (event: string, data: unknown) => {
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
-
-    try {
+    await streamSyncEvents(request, reply, ({ signal, onProgress }) => {
       const repositoryIds = catalogService.getUnanalyzedRepositoryIds();
-      const summary = await syncService.analyzeRepositories(repositoryIds, {
-        signal: abortController.signal,
-        onProgress: (current, total, repository, phase) => {
-          send('progress', { type: 'progress', current, total, repository, phase });
-        },
-      });
-
-      if (abortController.signal.aborted) {
-        send('cancelled', { type: 'cancelled', summary });
-      } else {
-        send('complete', { type: 'complete', summary });
-      }
-    } catch (error) {
-      send('error', { type: 'error', message: (error as Error).message });
-    }
-
-    reply.raw.end();
-    reply.hijack();
+      return syncService.analyzeRepositories(repositoryIds, { signal, onProgress });
+    });
   });
 
   app.post('/api/sync/analyze-all', async (request, reply) => {
-    const abortController = new AbortController();
-    request.raw.on('close', () => { abortController.abort(); });
-
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
-    const send = (event: string, data: unknown) => {
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
-
-    try {
+    await streamSyncEvents(request, reply, ({ signal, onProgress }) => {
       const repositoryIds = catalogService.getAllRepositoryIds();
       catalogService.resetAnalysisForRepositories(repositoryIds);
-      const summary = await syncService.analyzeRepositories(repositoryIds, {
-        signal: abortController.signal,
-        onProgress: (current, total, repository, phase) => {
-          send('progress', { type: 'progress', current, total, repository, phase });
-        },
-      });
-
-      if (abortController.signal.aborted) {
-        send('cancelled', { type: 'cancelled', summary });
-      } else {
-        send('complete', { type: 'complete', summary });
-      }
-    } catch (error) {
-      send('error', { type: 'error', message: (error as Error).message });
-    }
-
-    reply.raw.end();
-    reply.hijack();
+      return syncService.analyzeRepositories(repositoryIds, { signal, onProgress });
+    });
   });
 
   app.get('/api/stats', async () => {
