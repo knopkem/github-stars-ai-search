@@ -1,0 +1,14 @@
+{
+  "name": "github-stars-ai-search",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "dev": "concurrently -k -n shared,api,web -c cyan,green,magenta \"pnpm --filter @github-stars-ai-search/shared dev\" \"pnpm --filter @github-stars-ai-search/api dev\" \"pnpm --filter @github-stars-ai-search/web dev\"",
+    "build": "pnpm -r build",
+    "test": "pnpm -r --if-present test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
