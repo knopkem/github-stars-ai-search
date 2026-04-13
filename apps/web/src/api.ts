@@ -59,6 +59,157 @@ function getAbortedSyncSummary(): SyncSummary {
   };
 }
 
+class SyncRequestError extends Error {
+  readonly retryable: boolean;
+
+  constructor(
+    message: string,
+    retryable = false,
+  ) {
+    super(message);
+    this.name = 'SyncRequestError';
+    this.retryable = retryable;
+  }
+}
+
+const SYNC_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
+function isRetryableSyncStatus(status: number): boolean {
+  return status === 408
+    || status === 425
+    || status === 429
+    || status >= 500;
+}
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+
+    const onAbort = () => {
+      window.clearTimeout(timeoutId);
+      resolve();
+    };
+
+    const timeoutId = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function consumeSyncStream(
+  url: string,
+  onEvent: (event: SyncProgressEvent) => void,
+  signal?: AbortSignal,
+): Promise<SyncSummary> {
+  let completedSummary: SyncSummary | null = null;
+  const processEventBlock = (block: string) => {
+    const lines = block
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    const dataLine = lines.find((line) => line.startsWith('data: '));
+    if (!dataLine) {
+      return;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(dataLine.slice(6));
+    } catch {
+      throw new SyncRequestError('Received an invalid sync event from the server.');
+    }
+
+    const event = syncProgressEventSchema.safeParse(payload);
+    if (!event.success) {
+      throw new SyncRequestError('Received an invalid sync event from the server.');
+    }
+
+    onEvent(event.data);
+    if (event.data.type === 'complete' || event.data.type === 'cancelled') {
+      completedSummary = event.data.summary;
+    } else if (event.data.type === 'error') {
+      throw new SyncRequestError(event.data.message);
+    }
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal,
+    });
+  } catch (error) {
+    throw new SyncRequestError(getErrorMessage(error, 'The sync request failed.'), true);
+  }
+
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const payload = (await response.json()) as { message?: string };
+      message = payload.message ?? message;
+    } catch {
+      // use status text
+    }
+
+    throw new SyncRequestError(
+      message || `Request failed with ${response.status}`,
+      isRetryableSyncStatus(response.status),
+    );
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new SyncRequestError('No response body.', true);
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } catch (error) {
+      throw new SyncRequestError(getErrorMessage(error, 'The sync request failed.'), true);
+    }
+
+    if (chunk.done) {
+      break;
+    }
+
+    buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r/g, '');
+    let boundaryIndex = buffer.indexOf('\n\n');
+    while (boundaryIndex >= 0) {
+      processEventBlock(buffer.slice(0, boundaryIndex));
+      buffer = buffer.slice(boundaryIndex + 2);
+      boundaryIndex = buffer.indexOf('\n\n');
+    }
+  }
+
+  buffer += decoder.decode().replace(/\r/g, '');
+  if (buffer.trim()) {
+    processEventBlock(buffer);
+  }
+
+  if (completedSummary) {
+    return completedSummary;
+  }
+
+  if (signal?.aborted) {
+    return getAbortedSyncSummary();
+  }
+
+  throw new SyncRequestError('The sync request ended unexpectedly.', true);
+}
+
 export function getSettings(): Promise<AppSettings> {
   return request('/api/settings');
 }
@@ -118,111 +269,27 @@ function streamSync(
   onEvent: (event: SyncProgressEvent) => void,
   signal?: AbortSignal,
 ): Promise<SyncSummary> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const url = `${API_BASE_URL}${path}`;
-    const settleResolve = (summary: SyncSummary) => {
-      if (settled) return;
-      settled = true;
-      resolve(summary);
-    };
-    const settleReject = (error: unknown, fallback: string) => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(getErrorMessage(error, fallback)));
-    };
-    const processEventBlock = (block: string) => {
-      const lines = block
-        .split('\n')
-        .map((line) => line.trimEnd())
-        .filter(Boolean);
-      const dataLine = lines.find((line) => line.startsWith('data: '));
-      if (!dataLine) {
-        return;
-      }
+  const url = `${API_BASE_URL}${path}`;
 
-      let payload: unknown;
+  return (async () => {
+    for (let attempt = 0; attempt <= SYNC_RETRY_DELAYS_MS.length; attempt += 1) {
       try {
-        payload = JSON.parse(dataLine.slice(6));
+        return await consumeSyncStream(url, onEvent, signal);
       } catch (error) {
-        settleReject(error, 'Received an invalid sync event from the server.');
-        return;
-      }
-
-      const event = syncProgressEventSchema.safeParse(payload);
-      if (!event.success) {
-        settleReject('Received an invalid sync event from the server.', 'Received an invalid sync event from the server.');
-        return;
-      }
-
-      onEvent(event.data);
-      if (event.data.type === 'complete' || event.data.type === 'cancelled') {
-        settleResolve(event.data.summary);
-      } else if (event.data.type === 'error') {
-        settleReject(event.data.message, 'The sync request failed.');
-      }
-    };
-
-    fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-      signal,
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          let message = response.statusText;
-          try {
-            const payload = (await response.json()) as { message?: string };
-            message = payload.message ?? message;
-          } catch {
-            // use status text
-          }
-          throw new Error(message || `Request failed with ${response.status}`);
-        }
-
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error('No response body.');
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true }).replace(/\r/g, '');
-          let boundaryIndex = buffer.indexOf('\n\n');
-          while (boundaryIndex >= 0) {
-            processEventBlock(buffer.slice(0, boundaryIndex));
-            buffer = buffer.slice(boundaryIndex + 2);
-            boundaryIndex = buffer.indexOf('\n\n');
-          }
-        }
-
-        buffer += decoder.decode().replace(/\r/g, '');
-        if (buffer.trim()) {
-          processEventBlock(buffer);
-        }
-
-        if (!settled) {
-          if (signal?.aborted) {
-            settleResolve(getAbortedSyncSummary());
-            return;
-          }
-          settleReject('The server closed the sync stream before sending a final result.', 'The sync request ended unexpectedly.');
-        }
-      })
-      .catch((error) => {
         if (signal?.aborted) {
-          settleResolve(getAbortedSyncSummary());
-          return;
+          return getAbortedSyncSummary();
         }
-        settleReject(error, 'The sync request failed.');
-      });
-  });
+
+        if (!(error instanceof SyncRequestError) || !error.retryable || attempt >= SYNC_RETRY_DELAYS_MS.length) {
+          throw new Error(getErrorMessage(error, 'The sync request failed.'));
+        }
+
+        await wait(SYNC_RETRY_DELAYS_MS[attempt] ?? 0, signal);
+      }
+    }
+
+    throw new Error('The sync request failed.');
+  })();
 }
 
 export function syncFullCatalog(
@@ -230,6 +297,13 @@ export function syncFullCatalog(
   signal?: AbortSignal,
 ): Promise<SyncSummary> {
   return streamSync('/api/sync/full', onEvent, signal);
+}
+
+export function rebuildFullCatalog(
+  onEvent: (event: SyncProgressEvent) => void,
+  signal?: AbortSignal,
+): Promise<SyncSummary> {
+  return streamSync('/api/sync/rebuild-all', onEvent, signal);
 }
 
 export function analyzeRemaining(

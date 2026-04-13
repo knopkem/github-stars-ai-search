@@ -15,7 +15,23 @@ import { SettingsService } from './settingsService.js';
 
 const HIGH_SIGNAL_FILES = ['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'pom.xml'];
 
-function toRepositoryRecord(repository: GitHubStarredRepository): RepositoryRecord {
+const EMPTY_RELEASE_FINGERPRINT = '[]';
+
+interface SyncOptions {
+  forceReindex?: boolean;
+}
+
+interface RepositoryRefreshCandidate {
+  repository: GitHubStarredRepository;
+  repositoryRecord: RepositoryRecord;
+  rawReleases: GitHubRelease[];
+  discoveryIndex: number;
+}
+
+function toRepositoryRecord(
+  repository: GitHubStarredRepository,
+  existingRepository?: RepositoryRecord | null,
+): RepositoryRecord {
   return {
     id: repository.id,
     fullName: repository.full_name,
@@ -30,11 +46,11 @@ function toRepositoryRecord(repository: GitHubStarredRepository): RepositoryReco
     defaultBranch: repository.default_branch,
     pushedAt: repository.pushed_at,
     starredAt: repository.starred_at ?? null,
-    summary: null,
-    tags: [],
-    platforms: [],
-    watchReleases: false,
-    indexedAt: null,
+    summary: existingRepository?.summary ?? null,
+    tags: existingRepository?.tags ?? [],
+    platforms: existingRepository?.platforms ?? [],
+    watchReleases: existingRepository?.watchReleases ?? false,
+    indexedAt: existingRepository?.indexedAt ?? null,
   };
 }
 
@@ -65,8 +81,132 @@ function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
 }
 
+function normalizedTopics(topics: string[]): string[] {
+  return [...topics].sort();
+}
+
+function hasMeaningfulRepositoryChange(existingRepository: RepositoryRecord, repository: GitHubStarredRepository): boolean {
+  return existingRepository.fullName !== repository.full_name
+    || existingRepository.htmlUrl !== repository.html_url
+    || existingRepository.description !== repository.description
+    || existingRepository.language !== repository.language
+    || existingRepository.defaultBranch !== repository.default_branch
+    || JSON.stringify(normalizedTopics(existingRepository.topics)) !== JSON.stringify(normalizedTopics(repository.topics ?? []));
+}
+
+function fingerprintGitHubReleases(releases: GitHubRelease[]): string {
+  return JSON.stringify(
+    [...releases]
+      .sort((left, right) => left.id - right.id)
+      .map((release) => [
+        release.id,
+        release.tag_name,
+        release.name ?? '',
+        release.body ?? '',
+        release.published_at ?? '',
+        release.html_url,
+        release.prerelease ? 1 : 0,
+        release.draft ? 1 : 0,
+        [...release.assets]
+          .sort((left, right) => left.id - right.id)
+          .map((asset) => [
+            asset.id,
+            asset.name,
+            asset.size,
+            asset.download_count,
+            asset.content_type ?? '',
+            asset.browser_download_url,
+          ]),
+      ]),
+  );
+}
+
+function fingerprintStoredReleases(releases: ReleaseRecord[]): string {
+  return JSON.stringify(
+    [...releases]
+      .sort((left, right) => left.id - right.id)
+      .map((release) => [
+        release.id,
+        release.tagName,
+        release.name,
+        release.body,
+        release.publishedAt ?? '',
+        release.htmlUrl,
+        release.isPrerelease ? 1 : 0,
+        release.isDraft ? 1 : 0,
+        [...release.assets]
+          .sort((left, right) => left.id - right.id)
+          .map((asset) => [
+            asset.id,
+            asset.name,
+            asset.size,
+            asset.downloadCount,
+            asset.contentType ?? '',
+            asset.browserDownloadUrl,
+          ]),
+      ]),
+  );
+}
+
+function buildStoredReleaseFingerprintMap(releases: ReleaseRecord[]): Map<number, string> {
+  const releasesByRepositoryId = new Map<number, ReleaseRecord[]>();
+  for (const release of releases) {
+    const existing = releasesByRepositoryId.get(release.repositoryId) ?? [];
+    existing.push(release);
+    releasesByRepositoryId.set(release.repositoryId, existing);
+  }
+
+  return new Map(
+    Array.from(releasesByRepositoryId.entries()).map(([repositoryId, repositoryReleases]) => [
+      repositoryId,
+      fingerprintStoredReleases(repositoryReleases),
+    ]),
+  );
+}
+
 function formatDiscoveryProgress(discoveredCount: number): string {
   return `${discoveredCount} starred ${discoveredCount === 1 ? 'repository' : 'repositories'} discovered`;
+}
+
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  signal: AbortSignal | undefined,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) {
+    return;
+  }
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  if (workerCount <= 1) {
+    for (let index = 0; index < items.length; index += 1) {
+      if (signal?.aborted) {
+        break;
+      }
+      const item = items[index];
+      if (item !== undefined) {
+        await worker(item, index);
+      }
+    }
+    return;
+  }
+
+  let nextIndex = 0;
+  const runWorker = async (): Promise<void> => {
+    while (nextIndex < items.length) {
+      if (signal?.aborted) {
+        break;
+      }
+      const index = nextIndex++;
+      const item = items[index];
+      if (item !== undefined) {
+        await worker(item, index);
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 }
 
 function inferFacetsFallback(repository: RepositoryRecord): { summary: string; tags: string[]; platforms: string[] } {
@@ -194,6 +334,25 @@ export class SyncService {
     return documents;
   }
 
+  private buildEmbeddedDocuments(
+    repositoryFullName: string,
+    documents: SourceDocument[],
+    releases: ReleaseRecord[],
+  ): SourceDocument[] {
+    const embeddedDocuments = [...documents];
+    const releaseBodies = releases
+      .filter((release) => release.body.trim())
+      .slice(0, 3)
+      .map<SourceDocument>((release) => ({
+        kind: 'release-notes',
+        path: release.tagName,
+        title: `${repositoryFullName} ${release.tagName}`,
+        content: release.body,
+      }));
+    embeddedDocuments.push(...releaseBodies);
+    return embeddedDocuments;
+  }
+
   private async summarizeRepository(
     lmStudioConfig: UpdateLmStudioSettingsInput,
     repository: RepositoryRecord,
@@ -229,12 +388,67 @@ export class SyncService {
     }
   }
 
-  async syncFullCatalog(callbacks?: SyncCallbacks): Promise<SyncSummary> {
+  private async indexRepository(
+    githubClient: GitHubClient,
+    lmStudioClient: LMStudioClient,
+    lmStudioConfig: UpdateLmStudioSettingsInput,
+    repository: GitHubStarredRepository,
+    repositoryRecord: RepositoryRecord,
+    rawReleases: GitHubRelease[],
+    progress: { current: number; total: number },
+    callbacks?: SyncCallbacks,
+  ): Promise<{ chunkCount: number; releaseCount: number; completed: boolean }> {
+    const documents = await this.loadDocuments(githubClient, repository);
+    const releases = rawReleases.map((release) => toReleaseRecord(repository.id, repository.full_name, release));
+    this.catalogService.replaceReleases(repository.id, repository.full_name, releases);
+
+    if (callbacks?.signal?.aborted) {
+      return { chunkCount: 0, releaseCount: releases.length, completed: false };
+    }
+
+    callbacks?.onProgress?.(progress.current, progress.total, repository.full_name, 'indexing');
+
+    const embeddedDocuments = this.buildEmbeddedDocuments(repository.full_name, documents, releases);
+    const chunkDrafts = embeddedDocuments.flatMap((document) => chunkDocument(document).map((chunk) => ({ document, chunk })));
+    const embeddings = await lmStudioClient.embed(chunkDrafts.map(({ chunk }) => chunk.content));
+    const persistedChunks: PersistedChunk[] = [];
+    for (let index = 0; index < chunkDrafts.length; index += 1) {
+      const draft = chunkDrafts[index];
+      if (!draft) {
+        continue;
+      }
+      const { document, chunk } = draft;
+      const documentIndex = embeddedDocuments.indexOf(document);
+      persistedChunks.push({
+        repositoryId: repository.id,
+        documentIndex,
+        kind: chunk.kind,
+        path: chunk.path,
+        chunkIndex: chunk.chunkIndex,
+        content: chunk.content,
+        embedding: embeddings[index] ?? [],
+      });
+    }
+
+    this.catalogService.replaceDocumentsAndChunks(repository.id, embeddedDocuments, persistedChunks);
+
+    if (callbacks?.signal?.aborted) {
+      return { chunkCount: persistedChunks.length, releaseCount: releases.length, completed: false };
+    }
+
+    callbacks?.onProgress?.(progress.current, progress.total, repository.full_name, 'analyzing');
+
+    const facets = await this.summarizeRepository(lmStudioConfig, repositoryRecord, embeddedDocuments, releases);
+    this.catalogService.updateFacets(repository.id, facets.summary, facets.tags, facets.platforms, new Date().toISOString());
+
+    return { chunkCount: persistedChunks.length, releaseCount: releases.length, completed: true };
+  }
+
+  async syncFullCatalog(callbacks?: SyncCallbacks, options?: SyncOptions): Promise<SyncSummary> {
     const token = this.settingsService.getGitHubToken();
-    const lmStudioConfig = this.settingsService.getLmStudioConfig();
     const githubClient = new GitHubClient(token);
-    const lmStudioClient = new LMStudioClient(lmStudioConfig);
-    await lmStudioClient.testConnection();
+    const concurrency = this.settingsService.getPublicSettings().lmStudio?.concurrency ?? 1;
+    const forceReindex = options?.forceReindex === true;
 
     const repositories = await githubClient.fetchStarredRepositories(({ discoveredCount, estimatedTotalCount }) => {
       callbacks?.onProgress?.(
@@ -248,103 +462,93 @@ export class SyncService {
     let indexedRepositoryCount = 0;
     let releaseCount = 0;
     let chunkCount = 0;
-    const concurrency = lmStudioConfig.concurrency ?? 1;
+    const existingRepositories = new Map(this.catalogService.listRepositories().map((repository) => [repository.id, repository]));
+    const existingReleaseFingerprints = buildStoredReleaseFingerprintMap(this.catalogService.listReleases(false));
+    const refreshCandidates: RepositoryRefreshCandidate[] = [];
 
-    const processRepository = async (repository: GitHubStarredRepository, repoIndex: number): Promise<void> => {
+    await runWithConcurrency(repositories, concurrency, callbacks?.signal, async (repository, repoIndex) => {
       try {
         callbacks?.onProgress?.(repoIndex + 1, repositories.length, repository.full_name, 'fetching');
 
-        const repositoryRecord = toRepositoryRecord(repository);
+        const existingRepository = existingRepositories.get(repository.id) ?? null;
+        const repositoryRecord = toRepositoryRecord(repository, existingRepository);
         this.catalogService.upsertRepository(repositoryRecord);
 
-        // Intra-repo parallelism: fetch docs and releases simultaneously
-        const [documents, rawReleases] = await Promise.all([
-          this.loadDocuments(githubClient, repository),
-          githubClient.fetchReleases(repository.owner.login, repository.name),
-        ]);
+        let needsRefresh = forceReindex
+          || !existingRepository
+          || existingRepository.indexedAt === null
+          || existingRepository.pushedAt !== (repository.pushed_at ?? null)
+          || (existingRepository !== null && hasMeaningfulRepositoryChange(existingRepository, repository));
 
-        const releases = rawReleases.map((release) => toReleaseRecord(repository.id, repository.full_name, release));
-        this.catalogService.replaceReleases(repository.id, repository.full_name, releases);
-        releaseCount += releases.length;
-
-        if (callbacks?.signal?.aborted) return;
-
-        callbacks?.onProgress?.(repoIndex + 1, repositories.length, repository.full_name, 'indexing');
-
-        const embeddedDocuments = [...documents];
-        const releaseBodies = releases
-          .filter((release) => release.body.trim())
-          .slice(0, 3)
-          .map<SourceDocument>((release) => ({
-            kind: 'release-notes',
-            path: release.tagName,
-            title: `${repository.full_name} ${release.tagName}`,
-            content: release.body,
-          }));
-        embeddedDocuments.push(...releaseBodies);
-
-        const chunkDrafts = embeddedDocuments.flatMap((document) => chunkDocument(document).map((chunk) => ({ document, chunk })));
-        const embeddings = await lmStudioClient.embed(chunkDrafts.map(({ chunk }) => chunk.content));
-        const persistedChunks: PersistedChunk[] = [];
-        for (let index = 0; index < chunkDrafts.length; index += 1) {
-          const draft = chunkDrafts[index];
-          if (!draft) {
-            continue;
+        const releasesResult = await githubClient.fetchReleasesResult(repository.owner.login, repository.name);
+        if (!releasesResult.ok) {
+          warnings.push(`${repository.full_name}: ${releasesResult.error}`);
+          if (needsRefresh) {
+            refreshCandidates.push({
+              repository,
+              repositoryRecord,
+              rawReleases: [],
+              discoveryIndex: repoIndex,
+            });
           }
-          const { document, chunk } = draft;
-          const documentIndex = embeddedDocuments.indexOf(document);
-          persistedChunks.push({
-            repositoryId: repository.id,
-            documentIndex,
-            kind: chunk.kind,
-            path: chunk.path,
-            chunkIndex: chunk.chunkIndex,
-            content: chunk.content,
-            embedding: embeddings[index] ?? [],
-          });
+          return;
         }
 
-        this.catalogService.replaceDocumentsAndChunks(repository.id, embeddedDocuments, persistedChunks);
-        chunkCount += persistedChunks.length;
+        const currentReleaseFingerprint = fingerprintGitHubReleases(releasesResult.releases);
+        const previousReleaseFingerprint = existingReleaseFingerprints.get(repository.id) ?? EMPTY_RELEASE_FINGERPRINT;
+        if (currentReleaseFingerprint !== previousReleaseFingerprint) {
+          needsRefresh = true;
+        }
 
-        if (callbacks?.signal?.aborted) return;
-
-        callbacks?.onProgress?.(repoIndex + 1, repositories.length, repository.full_name, 'analyzing');
-
-        const facets = await this.summarizeRepository(lmStudioConfig, repositoryRecord, embeddedDocuments, releases);
-        this.catalogService.updateFacets(repository.id, facets.summary, facets.tags, facets.platforms, new Date().toISOString());
-        indexedRepositoryCount += 1;
+        if (needsRefresh) {
+          refreshCandidates.push({
+            repository,
+            repositoryRecord,
+            rawReleases: releasesResult.releases,
+            discoveryIndex: repoIndex,
+          });
+        }
       } catch (error) {
         warnings.push(`${repository.full_name}: ${(error as Error).message}`);
       }
-    };
+    });
 
-    if (concurrency <= 1) {
-      // Sequential processing (original behavior)
-      for (let i = 0; i < repositories.length; i++) {
-        if (callbacks?.signal?.aborted) break;
-        const repository = repositories[i];
-        if (repository) await processRepository(repository, i);
-      }
-    } else {
-      // Parallel processing with concurrency pool
-      let nextIndex = 0;
-      const runWorker = async (): Promise<void> => {
-        while (nextIndex < repositories.length) {
-          if (callbacks?.signal?.aborted) break;
-          const index = nextIndex++;
-          const repository = repositories[index];
-          if (repository) {
-            await processRepository(repository, index);
-          }
-        }
-      };
-
-      const workers = Array.from({ length: Math.min(concurrency, repositories.length) }, () => runWorker());
-      await Promise.all(workers);
+    const repositoriesToRefresh = refreshCandidates.sort((left, right) => left.discoveryIndex - right.discoveryIndex);
+    if (repositoriesToRefresh.length > 0) {
+      this.catalogService.markRepositoriesStale(repositoriesToRefresh.map((candidate) => candidate.repository.id));
     }
 
-    if (!callbacks?.signal?.aborted && repositories.length > 0) {
+    if (!callbacks?.signal?.aborted && repositoriesToRefresh.length > 0) {
+      const lmStudioConfig = this.settingsService.getLmStudioConfig();
+      const lmStudioClient = new LMStudioClient(lmStudioConfig);
+      await lmStudioClient.testConnection();
+
+      await runWithConcurrency(repositoriesToRefresh, concurrency, callbacks?.signal, async (candidate, refreshIndex) => {
+        try {
+          callbacks?.onProgress?.(refreshIndex + 1, repositoriesToRefresh.length, candidate.repository.full_name, 'fetching');
+          const result = await this.indexRepository(
+            githubClient,
+            lmStudioClient,
+            lmStudioConfig,
+            candidate.repository,
+            candidate.repositoryRecord,
+            candidate.rawReleases,
+            { current: refreshIndex + 1, total: repositoriesToRefresh.length },
+            callbacks,
+          );
+
+          releaseCount += result.releaseCount;
+          chunkCount += result.chunkCount;
+          if (result.completed) {
+            indexedRepositoryCount += 1;
+          }
+        } catch (error) {
+          warnings.push(`${candidate.repository.full_name}: ${(error as Error).message}`);
+        }
+      });
+    }
+
+    if (!callbacks?.signal?.aborted) {
       this.catalogService.deleteRepositoriesMissingFrom(repositories.map((repository) => repository.id));
     }
 
@@ -366,10 +570,11 @@ export class SyncService {
 
     const warnings: string[] = [];
     let indexedRepositoryCount = 0;
+    let releaseCount = 0;
     let chunkCount = 0;
     const concurrency = lmStudioConfig.concurrency ?? 1;
 
-    const processRepo = async (repoId: number, repoIndex: number): Promise<void> => {
+    await runWithConcurrency(repositoryIds, concurrency, callbacks?.signal, async (repoId, repoIndex) => {
       const repository = this.catalogService.getRepositoryById(repoId);
       if (!repository) return;
 
@@ -394,85 +599,32 @@ export class SyncService {
           starred_at: repository.starredAt ?? undefined,
         };
 
-        const [documents, rawReleases] = await Promise.all([
-          this.loadDocuments(githubClient, starredRepo),
-          githubClient.fetchReleases(owner, repoName),
-        ]);
+        const rawReleases = await githubClient.fetchReleases(owner, repoName);
+        const result = await this.indexRepository(
+          githubClient,
+          lmStudioClient,
+          lmStudioConfig,
+          starredRepo,
+          repository,
+          rawReleases,
+          { current: repoIndex + 1, total: repositoryIds.length },
+          callbacks,
+        );
 
-        const releases = rawReleases.map((release) => toReleaseRecord(repository.id, repository.fullName, release));
-
-        if (callbacks?.signal?.aborted) return;
-        callbacks?.onProgress?.(repoIndex + 1, repositoryIds.length, repository.fullName, 'indexing');
-
-        const embeddedDocuments = [...documents];
-        const releaseBodies = releases
-          .filter((release) => release.body.trim())
-          .slice(0, 3)
-          .map<SourceDocument>((release) => ({
-            kind: 'release-notes',
-            path: release.tagName,
-            title: `${repository.fullName} ${release.tagName}`,
-            content: release.body,
-          }));
-        embeddedDocuments.push(...releaseBodies);
-
-        const chunkDrafts = embeddedDocuments.flatMap((document) => chunkDocument(document).map((chunk) => ({ document, chunk })));
-        const embeddings = await lmStudioClient.embed(chunkDrafts.map(({ chunk }) => chunk.content));
-        const persistedChunks: PersistedChunk[] = [];
-        for (let index = 0; index < chunkDrafts.length; index += 1) {
-          const draft = chunkDrafts[index];
-          if (!draft) continue;
-          const { document, chunk } = draft;
-          const documentIndex = embeddedDocuments.indexOf(document);
-          persistedChunks.push({
-            repositoryId: repository.id,
-            documentIndex,
-            kind: chunk.kind,
-            path: chunk.path,
-            chunkIndex: chunk.chunkIndex,
-            content: chunk.content,
-            embedding: embeddings[index] ?? [],
-          });
+        releaseCount += result.releaseCount;
+        chunkCount += result.chunkCount;
+        if (result.completed) {
+          indexedRepositoryCount += 1;
         }
-
-        this.catalogService.replaceDocumentsAndChunks(repository.id, embeddedDocuments, persistedChunks);
-        chunkCount += persistedChunks.length;
-
-        if (callbacks?.signal?.aborted) return;
-        callbacks?.onProgress?.(repoIndex + 1, repositoryIds.length, repository.fullName, 'analyzing');
-
-        const facets = await this.summarizeRepository(lmStudioConfig, repository, embeddedDocuments, releases);
-        this.catalogService.updateFacets(repository.id, facets.summary, facets.tags, facets.platforms, new Date().toISOString());
-        indexedRepositoryCount += 1;
       } catch (error) {
         warnings.push(`${repository.fullName}: ${(error as Error).message}`);
       }
-    };
-
-    if (concurrency <= 1) {
-      for (let i = 0; i < repositoryIds.length; i++) {
-        if (callbacks?.signal?.aborted) break;
-        const id = repositoryIds[i];
-        if (id !== undefined) await processRepo(id, i);
-      }
-    } else {
-      let nextIndex = 0;
-      const runWorker = async (): Promise<void> => {
-        while (nextIndex < repositoryIds.length) {
-          if (callbacks?.signal?.aborted) break;
-          const index = nextIndex++;
-          const id = repositoryIds[index];
-          if (id !== undefined) await processRepo(id, index);
-        }
-      };
-      const workers = Array.from({ length: Math.min(concurrency, repositoryIds.length) }, () => runWorker());
-      await Promise.all(workers);
-    }
+    });
 
     return {
       repositoryCount: repositoryIds.length,
       indexedRepositoryCount,
-      releaseCount: 0,
+      releaseCount,
       chunkCount,
       warnings,
     };

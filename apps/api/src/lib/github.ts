@@ -1,3 +1,9 @@
+import {
+  RetryableHttpError,
+  isRetryableHttpStatus,
+  withDelayedRetry,
+} from './retry.js';
+
 export interface GitHubStarredRepository {
   id: number;
   name: string;
@@ -40,6 +46,10 @@ export interface StarredRepositoryDiscoveryProgress {
   estimatedTotalCount: number;
 }
 
+export type GitHubReleasesResult =
+  | { ok: true; releases: GitHubRelease[] }
+  | { ok: false; releases: []; error: string };
+
 const STARRED_REPOSITORIES_PAGE_SIZE = 100;
 
 function decodeGitHubContent(encodedContent: string): string {
@@ -81,22 +91,28 @@ export class GitHubClient {
   constructor(private readonly token: string) {}
 
   private async requestResponse(path: string, init?: RequestInit): Promise<Response> {
-    const response = await fetch(`https://api.github.com${path}`, {
-      ...init,
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${this.token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        ...(init?.headers ?? {}),
-      },
+    return withDelayedRetry(async () => {
+      const response = await fetch(`https://api.github.com${path}`, {
+        ...init,
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${this.token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          ...(init?.headers ?? {}),
+        },
+      });
+
+      if (!response.ok) {
+        const message = await response.text();
+        const errorMessage = `GitHub API error (${response.status}): ${message || response.statusText}`;
+        if (isRetryableHttpStatus(response.status)) {
+          throw new RetryableHttpError(errorMessage, response.status);
+        }
+        throw new Error(errorMessage);
+      }
+
+      return response;
     });
-
-    if (!response.ok) {
-      const message = await response.text();
-      throw new Error(`GitHub API error (${response.status}): ${message || response.statusText}`);
-    }
-
-    return response;
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -188,11 +204,25 @@ export class GitHubClient {
     }
   }
 
-  async fetchReleases(owner: string, repo: string): Promise<GitHubRelease[]> {
+  async fetchReleasesResult(owner: string, repo: string): Promise<GitHubReleasesResult> {
     try {
-      return await this.request<GitHubRelease[]>(`/repos/${owner}/${repo}/releases?per_page=10`);
-    } catch {
-      return [];
+      return {
+        ok: true,
+        releases: await this.request<GitHubRelease[]>(`/repos/${owner}/${repo}/releases?per_page=10`),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        releases: [],
+        error: error instanceof Error && error.message.trim()
+          ? error.message
+          : `Unable to fetch releases for ${owner}/${repo}.`,
+      };
     }
+  }
+
+  async fetchReleases(owner: string, repo: string): Promise<GitHubRelease[]> {
+    const result = await this.fetchReleasesResult(owner, repo);
+    return result.releases;
   }
 }

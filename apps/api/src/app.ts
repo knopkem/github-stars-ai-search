@@ -17,6 +17,7 @@ import { loadConfig } from './config.js';
 import { createDatabase } from './lib/db.js';
 import { EncryptionService } from './lib/crypto.js';
 import { GitHubClient } from './lib/github.js';
+import { registerLocalWebApp } from './lib/localWebApp.js';
 import { LMStudioClient } from './lib/lmStudio.js';
 import { CatalogService } from './services/catalogService.js';
 import { SearchService } from './services/searchService.js';
@@ -259,6 +260,12 @@ export async function buildApp(masterKey: Buffer) {
     );
   });
 
+  app.post('/api/sync/rebuild-all', async (request, reply) => {
+    await streamSyncEvents(request, reply, ({ signal, onProgress }) =>
+      syncService.syncFullCatalog({ signal, onProgress }, { forceReindex: true }),
+    );
+  });
+
   app.post('/api/sync/analyze-remaining', async (request, reply) => {
     await streamSyncEvents(request, reply, ({ signal, onProgress }) => {
       const repositoryIds = catalogService.getUnanalyzedRepositoryIds();
@@ -359,6 +366,8 @@ export async function buildApp(masterKey: Buffer) {
     }
     return { ok: true };
   });
+
+  registerLocalWebApp(app, config);
 
   app.setErrorHandler((error, _request, reply) => {
     app.log.error(error);

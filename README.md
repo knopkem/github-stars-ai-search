@@ -44,6 +44,33 @@ That starts:
 - API at `http://127.0.0.1:3001`
 - frontend at `http://127.0.0.1:5173`
 
+## Local app mode
+
+For regular day-to-day use on your own machine, run:
+
+```bash
+pnpm app
+```
+
+That launcher:
+
+- builds the workspace if build artifacts are missing
+- starts the API in local app mode
+- serves the built frontend from the same local URL
+- opens the browser at `http://127.0.0.1:3001`
+
+If you have pulled code changes and want a fresh rebuild first, run:
+
+```bash
+pnpm app:rebuild
+```
+
+If port `3001` is already in use, you can override it:
+
+```bash
+PORT=3100 pnpm app
+```
+
 ## Production-style build
 
 ```bash

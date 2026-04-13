@@ -4,7 +4,6 @@ import { RefreshCw } from 'lucide-react';
 import type { SearchResponse, SyncProgress, SyncProgressEvent, SyncSummary } from '@github-stars-ai-search/shared';
 import {
   addAssetFilter,
-  analyzeAll,
   analyzeRemaining,
   deleteAssetFilter,
   exportCatalog,
@@ -14,6 +13,7 @@ import {
   getSettings,
   getStats as getStatsApi,
   importCatalog,
+  rebuildFullCatalog,
   saveGitHubSettings,
   saveLmStudioSettings,
   searchCatalog,
@@ -27,6 +27,7 @@ import { CatalogView } from './components/CatalogView';
 import { ReleasesView } from './components/ReleasesView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { StatusBanner } from './components/StatusBanner';
+import { ToastStack, type ToastNotification } from './components/ToastStack';
 import { useCategories, filterByCategory } from './hooks/useCategories';
 
 type View = 'catalog' | 'releases' | 'settings';
@@ -111,14 +112,43 @@ function getSyncPhaseLabel(phase: SyncProgress['phase']): string {
   }
 }
 
+function getIncrementalSyncMessage(summary: SyncSummary, aborted: boolean): string {
+  if (aborted) {
+    return `Sync cancelled after updating ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
+  }
+  if (summary.indexedRepositoryCount === 0) {
+    return 'Catalog is already up to date.';
+  }
+  return `Updated ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories and ${summary.chunkCount} chunks.`;
+}
+
+function getPendingRefreshMessage(summary: SyncSummary, aborted: boolean): string {
+  if (aborted) {
+    return `Refresh cancelled after ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
+  }
+  if (summary.indexedRepositoryCount === 0) {
+    return 'No repositories are pending refresh.';
+  }
+  return `Refreshed ${summary.indexedRepositoryCount}/${summary.repositoryCount} pending repositories (${summary.chunkCount} chunks).`;
+}
+
+function getRebuildMessage(summary: SyncSummary, aborted: boolean): string {
+  if (aborted) {
+    return `Rebuild cancelled after refreshing ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`;
+  }
+  return `Rebuilt ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories and ${summary.chunkCount} chunks.`;
+}
+
 function App() {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>('catalog');
   const [banner, setBanner] = useState<BannerState>(null);
+  const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [_lastSyncSummary, setLastSyncSummary] = useState<SyncSummary | null>(null);
   const [latestSearch, setLatestSearch] = useState<SearchResponse | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
+  const toastIdRef = useRef(0);
 
   const settingsQuery = useQuery({
     queryKey: ['settings'],
@@ -148,6 +178,23 @@ function App() {
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const syncAbortRef = useRef<AbortController | null>(null);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }, []);
+
+  const showFeedback = useCallback((feedback: Exclude<BannerState, null>) => {
+    if (feedback.tone === 'error') {
+      setBanner(feedback);
+      return;
+    }
+
+    setBanner(null);
+    toastIdRef.current += 1;
+    const toastId = toastIdRef.current;
+    const toastTone: ToastNotification['tone'] = feedback.tone === 'success' ? 'success' : 'info';
+    setToasts((current) => [...current, { id: toastId, tone: toastTone, message: feedback.message }]);
+  }, []);
 
   const handleSync = useCallback(async () => {
     if (isSyncing) return;
@@ -183,13 +230,11 @@ function App() {
 
       setLastSyncSummary(summary);
       setLastSyncTime(new Date().toISOString());
-      setBanner({
+      showFeedback({
         tone: abortController.signal.aborted
           ? 'info'
           : summary.warnings.length > 0 ? 'info' : 'success',
-        message: abortController.signal.aborted
-          ? `Sync cancelled after indexing ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`
-          : `Indexed ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories and ${summary.chunkCount} chunks.`,
+        message: getIncrementalSyncMessage(summary, abortController.signal.aborted),
       });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['repositories'] }),
@@ -198,29 +243,37 @@ function App() {
       ]);
     } catch (error) {
       if (!abortController.signal.aborted) {
-        setBanner({ tone: 'error', message: getErrorMessage(error) });
+        showFeedback({ tone: 'error', message: getErrorMessage(error) });
       }
     } finally {
       setIsSyncing(false);
       setSyncProgress(null);
       syncAbortRef.current = null;
     }
-  }, [isSyncing, queryClient]);
+  }, [isSyncing, queryClient, showFeedback]);
 
   const handleCancelSync = useCallback(() => {
     syncAbortRef.current?.abort();
   }, []);
 
-  const handleAnalyze = useCallback(async (mode: 'remaining' | 'all') => {
+  const handleAnalyze = useCallback(async (mode: 'remaining' | 'rebuild') => {
     if (isSyncing) return;
     setIsSyncing(true);
-    setSyncProgress(null);
+    setSyncProgress(mode === 'rebuild'
+      ? {
+          type: 'progress',
+          current: 0,
+          total: 1,
+          repository: 'starred repositories',
+          phase: 'discovering',
+        }
+      : null);
     setBanner(null);
 
     const abortController = new AbortController();
     syncAbortRef.current = abortController;
     let lastRefresh = 0;
-    const analyzeFn = mode === 'remaining' ? analyzeRemaining : analyzeAll;
+    const analyzeFn = mode === 'remaining' ? analyzeRemaining : rebuildFullCatalog;
 
     try {
       const summary = await analyzeFn(
@@ -238,23 +291,27 @@ function App() {
       );
 
       setLastSyncSummary(summary);
-      setBanner({
+      if (mode === 'rebuild') {
+        setLastSyncTime(new Date().toISOString());
+      }
+      showFeedback({
         tone: abortController.signal.aborted
           ? 'info'
           : summary.warnings.length > 0 ? 'info' : 'success',
-        message: abortController.signal.aborted
-          ? `Analysis cancelled after ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories.`
-          : `Analyzed ${summary.indexedRepositoryCount}/${summary.repositoryCount} repositories (${summary.chunkCount} chunks).`,
+        message: mode === 'remaining'
+          ? getPendingRefreshMessage(summary, abortController.signal.aborted)
+          : getRebuildMessage(summary, abortController.signal.aborted),
       });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['repositories'] }),
+        queryClient.invalidateQueries({ queryKey: ['releases'] }),
         queryClient.invalidateQueries({ queryKey: ['stats'] }),
       ]);
     } catch (error) {
       if (!abortController.signal.aborted) {
-        setBanner({
+        showFeedback({
           tone: 'error',
-          message: `${mode === 'remaining' ? 'Rerun Remaining' : 'Rerun All'} failed: ${getErrorMessage(error)}`,
+          message: `${mode === 'remaining' ? 'Refresh Pending' : 'Rebuild All'} failed: ${getErrorMessage(error)}`,
         });
       }
     } finally {
@@ -262,14 +319,14 @@ function App() {
       setSyncProgress(null);
       syncAbortRef.current = null;
     }
-  }, [isSyncing, queryClient]);
+  }, [isSyncing, queryClient, showFeedback]);
 
   const searchMutation = useMutation({
     mutationFn: searchCatalog,
     onSuccess: (response) => {
       const metadata = extractSearchMetadata(response);
       setLatestSearch(response);
-      setBanner({
+      showFeedback({
         tone: 'info',
         message: [
           `Found ${metadata?.resultCount ?? response.results.length} ranked results for "${response.query}".`,
@@ -281,7 +338,7 @@ function App() {
       });
     },
     onError: (error) => {
-      setBanner({ tone: 'error', message: (error as Error).message });
+      showFeedback({ tone: 'error', message: (error as Error).message });
     },
   });
 
@@ -304,7 +361,7 @@ function App() {
         queryClient.invalidateQueries({ queryKey: ['releases'] }),
       ]);
     },
-    onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+    onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
   });
 
   const deleteAssetFilterMutation = useMutation({
@@ -321,23 +378,23 @@ function App() {
     saveGitHub: useMutation({
       mutationFn: saveGitHubSettings,
       onSuccess: async () => {
-        setBanner({ tone: 'success', message: 'GitHub token saved securely on the server.' });
+        showFeedback({ tone: 'success', message: 'GitHub token saved securely on the server.' });
         await queryClient.invalidateQueries({ queryKey: ['settings'] });
       },
-      onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+      onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
     }),
     testGitHub: useMutation({
       mutationFn: testGitHubSettings,
-      onSuccess: () => setBanner({ tone: 'success', message: 'GitHub token is valid.' }),
-      onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+      onSuccess: () => showFeedback({ tone: 'success', message: 'GitHub token is valid.' }),
+      onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
     }),
     saveLmStudio: useMutation({
       mutationFn: saveLmStudioSettings,
       onSuccess: async () => {
-        setBanner({ tone: 'success', message: 'LM Studio settings saved.' });
+        showFeedback({ tone: 'success', message: 'LM Studio settings saved.' });
         await queryClient.invalidateQueries({ queryKey: ['settings'] });
       },
-      onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+      onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
     }),
     exportCatalog: useMutation({
       mutationFn: exportCatalog,
@@ -349,21 +406,21 @@ function App() {
         anchor.download = `github-stars-ai-search-${new Date().toISOString().slice(0, 10)}.json`;
         anchor.click();
         URL.revokeObjectURL(url);
-        setBanner({ tone: 'success', message: 'Export created successfully.' });
+        showFeedback({ tone: 'success', message: 'Export created successfully.' });
       },
-      onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+      onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
     }),
     importCatalog: useMutation({
       mutationFn: importCatalog,
       onSuccess: async () => {
-        setBanner({ tone: 'success', message: 'Catalog import completed.' });
+        showFeedback({ tone: 'success', message: 'Catalog import completed.' });
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ['repositories'] }),
           queryClient.invalidateQueries({ queryKey: ['releases'] }),
           queryClient.invalidateQueries({ queryKey: ['asset-filters'] }),
         ]);
       },
-      onError: (error) => setBanner({ tone: 'error', message: (error as Error).message }),
+      onError: (error) => showFeedback({ tone: 'error', message: (error as Error).message }),
     }),
   };
 
@@ -399,6 +456,7 @@ function App() {
 
   return (
     <div className="flex flex-col min-h-screen">
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
       <Header
         currentView={view}
         onChangeView={setView}
@@ -464,14 +522,14 @@ function App() {
               disabled={isSyncing}
               className="px-3 py-1 text-xs rounded bg-accent-blue/20 text-accent-blue hover:bg-accent-blue/30 disabled:opacity-50 transition-colors"
             >
-              Rerun Remaining
+              Refresh Pending
             </button>
             <button
-              onClick={() => handleAnalyze('all')}
+              onClick={() => handleAnalyze('rebuild')}
               disabled={isSyncing}
               className="px-3 py-1 text-xs rounded bg-accent-purple/20 text-accent-purple hover:bg-accent-purple/30 disabled:opacity-50 transition-colors"
             >
-              Rerun All
+              Rebuild All
             </button>
           </div>
         </div>

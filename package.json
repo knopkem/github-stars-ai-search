@@ -5,6 +5,8 @@
   "packageManager": "pnpm@10.33.0",
   "scripts": {
     "dev": "concurrently -k -n shared,api,web -c cyan,green,magenta \"pnpm --filter @github-stars-ai-search/shared dev\" \"pnpm --filter @github-stars-ai-search/api dev\" \"pnpm --filter @github-stars-ai-search/web dev\"",
+    "app": "node scripts/run-local-app.mjs",
+    "app:rebuild": "node scripts/run-local-app.mjs --rebuild",
     "build": "pnpm -r build",
     "test": "pnpm -r --if-present test"
   },

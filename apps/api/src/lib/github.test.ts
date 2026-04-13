@@ -33,6 +33,7 @@ function createJsonResponse(body: unknown, headers?: Record<string, string>) {
 describe('GitHubClient', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it('reports discovery progress while collecting starred repositories', async () => {
@@ -89,5 +90,23 @@ describe('GitHubClient', () => {
       discoveredCount: 100,
       estimatedTotalCount: 100,
     });
+  });
+
+  it('retries transient network failures while fetching starred repositories', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('network error'))
+      .mockResolvedValueOnce(createJsonResponse([]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new GitHubClient('test-token');
+    const repositoriesPromise = client.fetchStarredRepositories();
+
+    await vi.runAllTimersAsync();
+    const repositories = await repositoriesPromise;
+
+    expect(repositories).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

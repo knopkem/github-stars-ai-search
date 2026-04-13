@@ -3,6 +3,11 @@ import {
   type LmStudioTestResult,
   type UpdateLmStudioSettingsInput,
 } from '@github-stars-ai-search/shared';
+import {
+  RetryableHttpError,
+  isRetryableHttpStatus,
+  withDelayedRetry,
+} from './retry.js';
 
 interface ChatResponse {
   choices?: Array<{
@@ -129,15 +134,23 @@ export class LMStudioClient {
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     };
 
-    const response = await fetch(buildApiUrl(normalizedUrl, 'v1/models'), {
-      method: 'GET',
-      headers,
-    });
+    const response = await withDelayedRetry(async () => {
+      const currentResponse = await fetch(buildApiUrl(normalizedUrl, 'v1/models'), {
+        method: 'GET',
+        headers,
+      });
 
-    if (!response.ok) {
-      const message = await response.text();
-      throw new Error(`LM Studio models error (${response.status}): ${message || response.statusText}`);
-    }
+      if (!currentResponse.ok) {
+        const message = await currentResponse.text();
+        const errorMessage = `LM Studio models error (${currentResponse.status}): ${message || currentResponse.statusText}`;
+        if (isRetryableHttpStatus(currentResponse.status)) {
+          throw new RetryableHttpError(errorMessage, currentResponse.status);
+        }
+        throw new Error(errorMessage);
+      }
+
+      return currentResponse;
+    });
 
     const payload = (await response.json()) as ModelsResponse;
     const models = payload.data ?? [];
@@ -162,24 +175,32 @@ export class LMStudioClient {
   }
 
   async chat(userPrompt: string, systemPrompt: string, maxTokens = 256): Promise<string> {
-    const response = await fetch(buildApiUrl(this.baseUrl, 'v1/chat/completions'), {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify({
-        model: this.chatModel,
-        temperature: 0.1,
-        max_tokens: maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-      }),
-    });
+    const response = await withDelayedRetry(async () => {
+      const currentResponse = await fetch(buildApiUrl(this.baseUrl, 'v1/chat/completions'), {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          model: this.chatModel,
+          temperature: 0.1,
+          max_tokens: maxTokens,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+        }),
+      });
 
-    if (!response.ok) {
-      const message = await response.text();
-      throw new Error(`LM Studio chat error (${response.status}): ${message || response.statusText}`);
-    }
+      if (!currentResponse.ok) {
+        const message = await currentResponse.text();
+        const errorMessage = `LM Studio chat error (${currentResponse.status}): ${message || currentResponse.statusText}`;
+        if (isRetryableHttpStatus(currentResponse.status)) {
+          throw new RetryableHttpError(errorMessage, currentResponse.status);
+        }
+        throw new Error(errorMessage);
+      }
+
+      return currentResponse;
+    });
 
     const payload = (await response.json()) as ChatResponse;
     const content = payload.choices?.[0]?.message?.content?.trim();
@@ -199,19 +220,27 @@ export class LMStudioClient {
       return [];
     }
 
-    const response = await fetch(buildApiUrl(this.baseUrl, 'v1/embeddings'), {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify({
-        model: this.embeddingModel,
-        input: texts,
-      }),
-    });
+    const response = await withDelayedRetry(async () => {
+      const currentResponse = await fetch(buildApiUrl(this.baseUrl, 'v1/embeddings'), {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          model: this.embeddingModel,
+          input: texts,
+        }),
+      });
 
-    if (!response.ok) {
-      const message = await response.text();
-      throw new Error(`LM Studio embeddings error (${response.status}): ${message || response.statusText}`);
-    }
+      if (!currentResponse.ok) {
+        const message = await currentResponse.text();
+        const errorMessage = `LM Studio embeddings error (${currentResponse.status}): ${message || currentResponse.statusText}`;
+        if (isRetryableHttpStatus(currentResponse.status)) {
+          throw new RetryableHttpError(errorMessage, currentResponse.status);
+        }
+        throw new Error(errorMessage);
+      }
+
+      return currentResponse;
+    });
 
     const payload = (await response.json()) as EmbeddingResponse;
     return (payload.data ?? []).map((item) => item.embedding ?? []);

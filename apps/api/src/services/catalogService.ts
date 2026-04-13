@@ -560,6 +560,12 @@ export class CatalogService {
     return rows.map((r) => r.id);
   }
 
+  markRepositoriesStale(repositoryIds: number[]): void {
+    if (repositoryIds.length === 0) return;
+    const placeholders = repositoryIds.map(() => '?').join(',');
+    this.db.prepare(`UPDATE repositories SET indexed_at = NULL WHERE id IN (${placeholders})`).run(...repositoryIds);
+  }
+
   resetAnalysisForRepositories(repositoryIds: number[]): void {
     if (repositoryIds.length === 0) return;
     const placeholders = repositoryIds.map(() => '?').join(',');
