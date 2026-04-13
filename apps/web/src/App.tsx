@@ -36,6 +36,58 @@ type BannerState = {
   message: string;
 } | null;
 
+const AI_SEARCH_LIMIT = 25;
+
+function extractSearchMetadata(response: SearchResponse | null) {
+  if (!response) {
+    return null;
+  }
+
+  const rawResponse = response as SearchResponse & {
+    resultCount?: number | null;
+    durationMs?: number | null;
+    metadata?: Record<string, unknown>;
+    searchStrategy?: string | null;
+    timingMs?: number | null;
+    totalCandidates?: number | null;
+  };
+  const metadata = rawResponse.metadata ?? {};
+  const resultCount =
+    typeof rawResponse.resultCount === 'number'
+      ? rawResponse.resultCount
+      : typeof rawResponse.totalCandidates === 'number'
+        ? rawResponse.totalCandidates
+      : typeof metadata.resultCount === 'number'
+        ? metadata.resultCount
+        : typeof metadata.totalCandidates === 'number'
+          ? metadata.totalCandidates
+        : response.results.length;
+  const strategy =
+    typeof rawResponse.strategy === 'string'
+      ? rawResponse.strategy
+      : typeof rawResponse.searchStrategy === 'string'
+        ? rawResponse.searchStrategy
+        : typeof metadata.strategy === 'string'
+          ? metadata.strategy
+          : null;
+  const durationMs =
+    typeof rawResponse.durationMs === 'number'
+      ? rawResponse.durationMs
+      : typeof rawResponse.timingMs === 'number'
+        ? rawResponse.timingMs
+        : typeof metadata.durationMs === 'number'
+          ? metadata.durationMs
+          : typeof metadata.timingMs === 'number'
+            ? metadata.timingMs
+            : null;
+
+  return {
+    resultCount,
+    strategy,
+    durationMs,
+  };
+}
+
 function App() {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>('catalog');
@@ -183,10 +235,17 @@ function App() {
   const searchMutation = useMutation({
     mutationFn: searchCatalog,
     onSuccess: (response) => {
+      const metadata = extractSearchMetadata(response);
       setLatestSearch(response);
       setBanner({
         tone: 'info',
-        message: `Found ${response.results.length} ranked results for "${response.query}".`,
+        message: [
+          `Found ${metadata?.resultCount ?? response.results.length} ranked results for "${response.query}".`,
+          metadata?.strategy ? `Strategy: ${metadata.strategy}` : null,
+          metadata?.durationMs !== null && metadata?.durationMs !== undefined
+            ? `${Math.round(metadata.durationMs)} ms`
+            : null,
+        ].filter(Boolean).join(' • '),
       });
     },
     onError: (error) => {
@@ -277,15 +336,16 @@ function App() {
   };
 
   const repositories = repositoriesQuery.data?.repositories ?? [];
-  const activeSearchResults = latestSearch?.results ?? [];
+  const searchMetadata = useMemo(() => extractSearchMetadata(latestSearch), [latestSearch]);
   const catalogRows = useMemo(() => {
-    if (activeSearchResults.length > 0) {
-      return activeSearchResults.map((result) => ({
+    if (latestSearch) {
+      return latestSearch.results.map((result) => ({
         repository: result.repository,
         score: result.score,
         reasons: result.reasons,
         evidenceSnippets: result.evidenceSnippets,
         matchedDocumentKinds: result.matchedDocumentKinds,
+        relevanceExplanation: result.relevanceExplanation ?? null,
       }));
     }
 
@@ -295,8 +355,9 @@ function App() {
       reasons: [],
       evidenceSnippets: [],
       matchedDocumentKinds: [],
+      relevanceExplanation: null,
     }));
-  }, [activeSearchResults, repositories]);
+  }, [latestSearch, repositories]);
 
   const categories = useCategories(repositories);
   const categoryFilteredIds = useMemo(
@@ -404,6 +465,8 @@ function App() {
           {view === 'catalog' && (
             <CatalogView
               rows={catalogRows}
+              searchResponse={latestSearch}
+              searchMetadata={searchMetadata}
               allRepositories={repositories}
               isLoading={repositoriesQuery.isLoading || searchMutation.isPending}
               totalRepositories={repositories.length}
@@ -413,7 +476,7 @@ function App() {
                   setLatestSearch(null);
                   return;
                 }
-                searchMutation.mutate({ query });
+                searchMutation.mutate({ query, limit: AI_SEARCH_LIMIT });
               }}
               onClearSearch={() => setLatestSearch(null)}
               onToggleWatchReleases={(repository, watchReleases) =>

@@ -6,7 +6,7 @@ Local-first GitHub stars management with a Node API, a React frontend, and LM St
 
 - Sync your starred repositories from GitHub
 - Fetch README content, release notes, and high-signal manifest files
-- Generate English summaries, tags, and platform hints with LM Studio
+- Generate summaries, tags, and platform hints with LM Studio
 - Store chunk embeddings for hybrid semantic + keyword search
 - Track releases and filter assets by saved keywords
 - Export and import the local catalog as JSON

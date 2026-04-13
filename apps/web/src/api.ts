@@ -184,10 +184,10 @@ export function getRepositories(): Promise<{ repositories: AppSettings extends n
   return request('/api/repositories');
 }
 
-export function searchCatalog(input: { query: string }): Promise<SearchResponse> {
+export function searchCatalog(input: { query: string; limit?: number }): Promise<SearchResponse> {
   return request('/api/search', {
     method: 'POST',
-    body: JSON.stringify({ query: input.query }),
+    body: JSON.stringify(input),
   });
 }
 

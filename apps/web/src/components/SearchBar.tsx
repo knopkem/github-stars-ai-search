@@ -6,9 +6,10 @@ interface SearchBarProps {
   onRealtimeFilter: (query: string) => void;
   onClear: () => void;
   isSearching: boolean;
+  aiResultLimit?: number;
 }
 
-export function SearchBar({ onSearch, onRealtimeFilter, onClear, isSearching }: SearchBarProps) {
+export function SearchBar({ onSearch, onRealtimeFilter, onClear, isSearching, aiResultLimit = 25 }: SearchBarProps) {
   const [query, setQuery] = useState('');
   const [isRealtime, setIsRealtime] = useState(true);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -92,7 +93,7 @@ export function SearchBar({ onSearch, onRealtimeFilter, onClear, isSearching }: 
         ) : (
           <p className="text-xs text-accent-purple flex items-center gap-1.5">
             <Sparkles className="w-3 h-3" />
-            AI deep search — press Enter or click AI Search for semantic results
+            AI deep search — press Enter or click AI Search for up to {aiResultLimit} semantic results
           </p>
         )}
         {!isRealtime && (

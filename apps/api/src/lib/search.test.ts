@@ -8,7 +8,8 @@ describe('search helpers', () => {
   });
 
   it('sanitizes fts queries', () => {
-    expect(sanitizeFtsQuery('audio production!')).toContain('"audio"');
-    expect(sanitizeFtsQuery('audio production!')).toContain('"production"');
+    expect(sanitizeFtsQuery('audio production!')).toBe('"audio" AND "production"');
+    expect(sanitizeFtsQuery('"audio production" OR synth-pop')).toBe('"audio production" OR "synth-pop"');
+    expect(sanitizeFtsQuery('audio or production')).toBe('"audio" OR "production"');
   });
 });

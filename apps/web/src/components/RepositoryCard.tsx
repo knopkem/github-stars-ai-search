@@ -11,6 +11,7 @@ interface RepositoryCardProps {
   reasons: string[];
   evidenceSnippets: string[];
   matchedDocumentKinds: string[];
+  relevanceExplanation: string | null;
   onToggleWatchReleases: (repo: RepositoryRecord, watch: boolean) => void;
   animationDelay?: number;
 }
@@ -27,6 +28,7 @@ export function RepositoryCard({
   reasons,
   evidenceSnippets,
   matchedDocumentKinds,
+  relevanceExplanation,
   onToggleWatchReleases,
   animationDelay = 0,
 }: RepositoryCardProps) {
@@ -109,6 +111,12 @@ export function RepositoryCard({
         <p className="text-xs text-accent-green mb-2 flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-accent-green" />
           AI Summary
+        </p>
+      )}
+
+      {relevanceExplanation && (
+        <p className="mb-3 rounded-lg border border-accent-purple/15 bg-accent-purple/5 px-3 py-2 text-xs text-text-secondary line-clamp-3">
+          {relevanceExplanation}
         </p>
       )}
 

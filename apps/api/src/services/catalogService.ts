@@ -9,6 +9,7 @@ import {
 } from '@github-stars-ai-search/shared';
 import type { SourceDocument } from '../lib/chunking.js';
 import type { ChunkRow, DocumentRow, ReleaseRow, RepositoryRow } from '../lib/db.js';
+import { cosineSimilarity, type RankedVectorMatch } from '../lib/search.js';
 
 function parseJsonArray<T>(value: string): T[] {
   try {
@@ -67,6 +68,14 @@ export interface PersistedChunk {
   embedding: number[];
 }
 
+interface SearchableChunk {
+  id: number;
+  repositoryId: number;
+  kind: string;
+  snippet: string;
+  embedding: Float32Array;
+}
+
 function withTransaction<T>(db: DatabaseSync, callback: () => T): T {
   db.exec('BEGIN');
   try {
@@ -90,7 +99,44 @@ function typedRow<T>(row: SqliteRow | undefined): T | undefined {
 }
 
 export class CatalogService {
+  private searchableChunksCache: SearchableChunk[] | null = null;
+
+  private readonly parsedEmbeddingCache = new Map<number, Float32Array>();
+
   constructor(private readonly db: DatabaseSync) {}
+
+  private invalidateChunkCaches(): void {
+    this.searchableChunksCache = null;
+    this.parsedEmbeddingCache.clear();
+  }
+
+  private getParsedEmbedding(chunkId: number, embeddingJson: string): Float32Array {
+    const cached = this.parsedEmbeddingCache.get(chunkId);
+    if (cached) {
+      return cached;
+    }
+
+    const parsed = parseJsonArray<number>(embeddingJson).map((value) => (Number.isFinite(value) ? value : 0));
+    const embedding = Float32Array.from(parsed);
+    this.parsedEmbeddingCache.set(chunkId, embedding);
+    return embedding;
+  }
+
+  private getSearchableChunks(): SearchableChunk[] {
+    if (this.searchableChunksCache) {
+      return this.searchableChunksCache;
+    }
+
+    const rows = this.getAllChunkRows();
+    this.searchableChunksCache = rows.map((row) => ({
+      id: row.id,
+      repositoryId: row.repository_id,
+      kind: row.kind,
+      snippet: row.content.slice(0, 220),
+      embedding: this.getParsedEmbedding(row.id, row.embedding_json),
+    }));
+    return this.searchableChunksCache;
+  }
 
   listRepositories(): RepositoryRecord[] {
     const rows = this.db
@@ -278,6 +324,7 @@ export class CatalogService {
         ftsInsert.run(rowid, repositoryId, chunk.kind, chunk.path, chunk.content);
       }
     });
+    this.invalidateChunkCaches();
   }
 
   deleteRepositoriesMissingFrom(validRepositoryIds: number[]): void {
@@ -290,11 +337,15 @@ export class CatalogService {
         DELETE FROM releases;
         DELETE FROM repositories;
       `);
+      this.invalidateChunkCaches();
       return;
     }
 
     const placeholders = validRepositoryIds.map(() => '?').join(', ');
+    this.db.prepare(`DELETE FROM chunk_fts WHERE repository_id NOT IN (${placeholders})`).run(...validRepositoryIds);
+    this.db.prepare(`DELETE FROM repository_fts WHERE rowid NOT IN (${placeholders})`).run(...validRepositoryIds);
     this.db.prepare(`DELETE FROM repositories WHERE id NOT IN (${placeholders})`).run(...validRepositoryIds);
+    this.invalidateChunkCaches();
   }
 
   updateFacets(repositoryId: number, summary: string, tags: string[], platforms: string[], indexedAt: string): void {
@@ -324,6 +375,25 @@ export class CatalogService {
 
   getAllChunkRows(): ChunkRow[] {
     return typedRows<ChunkRow>(this.db.prepare('SELECT * FROM chunks').all());
+  }
+
+  rankChunkVectors(queryEmbedding: ArrayLike<number>, limit: number, minScore: number): RankedVectorMatch[] {
+    if (limit <= 0 || queryEmbedding.length === 0) {
+      return [];
+    }
+
+    return this.getSearchableChunks()
+      .map((chunk) => ({
+        chunkId: chunk.id,
+        repositoryId: chunk.repositoryId,
+        kind: chunk.kind,
+        snippet: chunk.snippet,
+        score: cosineSimilarity(queryEmbedding, chunk.embedding),
+      }))
+      .filter((match) => Number.isFinite(match.score) && match.score >= minScore)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit)
+      .map(({ chunkId: _chunkId, ...match }) => match);
   }
 
   getRepositoryByIds(ids: number[]): Map<number, RepositoryRecord> {
@@ -477,6 +547,7 @@ export class CatalogService {
         `).run(chunk.id, chunk.repositoryId, chunk.kind, chunk.path, chunk.content);
       }
     });
+    this.invalidateChunkCaches();
   }
 
   getUnanalyzedRepositoryIds(): number[] {
@@ -496,6 +567,7 @@ export class CatalogService {
     this.db.prepare(`DELETE FROM chunks WHERE repository_id IN (${placeholders})`).run(...repositoryIds);
     this.db.prepare(`DELETE FROM documents WHERE repository_id IN (${placeholders})`).run(...repositoryIds);
     this.db.prepare(`UPDATE repositories SET indexed_at = NULL, summary = NULL, tags_json = '[]', platforms_json = '[]' WHERE id IN (${placeholders})`).run(...repositoryIds);
+    this.invalidateChunkCaches();
   }
 
   getRepositoryById(id: number): RepositoryRecord | null {

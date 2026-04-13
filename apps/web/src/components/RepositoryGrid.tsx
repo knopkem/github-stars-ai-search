@@ -7,6 +7,7 @@ interface CatalogRow {
   reasons: string[];
   evidenceSnippets: string[];
   matchedDocumentKinds: string[];
+  relevanceExplanation: string | null;
 }
 
 interface RepositoryGridProps {
@@ -74,7 +75,7 @@ export function RepositoryGrid({ rows, isLoading, displayMode, onToggleWatchRele
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-      {rows.map(({ repository, score, reasons, evidenceSnippets, matchedDocumentKinds }, index) => (
+      {rows.map(({ repository, score, reasons, evidenceSnippets, matchedDocumentKinds, relevanceExplanation }, index) => (
         <RepositoryCard
           key={repository.id}
           repository={repository}
@@ -83,6 +84,7 @@ export function RepositoryGrid({ rows, isLoading, displayMode, onToggleWatchRele
           reasons={reasons}
           evidenceSnippets={evidenceSnippets}
           matchedDocumentKinds={matchedDocumentKinds}
+          relevanceExplanation={relevanceExplanation}
           onToggleWatchReleases={onToggleWatchReleases}
           animationDelay={Math.min(index * 30, 300)}
         />

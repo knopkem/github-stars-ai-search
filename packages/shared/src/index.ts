@@ -87,7 +87,7 @@ export const updateLmStudioSettingsSchema = z.object({
 
 export const searchRequestSchema = z.object({
   query: z.string().trim().min(1),
-  limit: z.number().int().min(1).max(25).optional().default(12),
+  limit: z.number().int().min(1).max(100).optional().default(25),
 });
 
 export const searchResultSchema = z.object({
@@ -96,10 +96,30 @@ export const searchResultSchema = z.object({
   reasons: z.array(z.string()),
   evidenceSnippets: z.array(z.string()),
   matchedDocumentKinds: z.array(z.string()),
+  relevanceExplanation: z.string().trim().min(1).optional(),
+});
+
+export const searchStrategySchema = z.enum(['fast', 'semantic', 'deep']);
+export const queryAnalysisTypeSchema = z.enum(['simple', 'semantic', 'complex']);
+export const searchMetadataSchema = z.object({
+  strategy: searchStrategySchema,
+  timingMs: z.number().nonnegative(),
+  totalCandidates: z.number().int().nonnegative(),
+  analysisType: queryAnalysisTypeSchema,
+  expandedQuery: z.string(),
+  intent: z.string(),
+  keywords: z.array(z.string()),
+  hypotheticalDocument: z.string().trim().min(1).optional(),
+  hypotheticalDocumentUsed: z.boolean(),
+  semanticEmbeddingMode: z.enum(['raw-query', 'hyde-averaged']),
 });
 
 export const searchResponseSchema = z.object({
   query: z.string(),
+  strategy: searchStrategySchema,
+  timingMs: z.number().nonnegative(),
+  totalCandidates: z.number().int().nonnegative(),
+  metadata: searchMetadataSchema,
   results: z.array(searchResultSchema),
 });
 
@@ -214,6 +234,9 @@ export type UpdateLmStudioSettingsInput = z.infer<typeof updateLmStudioSettingsS
 export type SearchRequest = z.infer<typeof searchRequestSchema>;
 export type SearchResponse = z.infer<typeof searchResponseSchema>;
 export type SearchResult = z.infer<typeof searchResultSchema>;
+export type SearchStrategy = z.infer<typeof searchStrategySchema>;
+export type QueryAnalysisType = z.infer<typeof queryAnalysisTypeSchema>;
+export type SearchMetadata = z.infer<typeof searchMetadataSchema>;
 export type SyncSummary = z.infer<typeof syncSummarySchema>;
 export type SyncProgressEvent = z.infer<typeof syncProgressEventSchema>;
 export type ExportPayload = z.infer<typeof exportPayloadSchema>;
