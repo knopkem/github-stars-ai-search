@@ -102,6 +102,10 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function shouldHandleRetryAtUiLevel(event: SyncProgressEvent): boolean {
+  return event.type === 'progress' && event.phase !== 'discovering';
+}
+
 async function consumeSyncStream(
   url: string,
   onEvent: (event: SyncProgressEvent) => void,
@@ -270,11 +274,18 @@ function streamSync(
   signal?: AbortSignal,
 ): Promise<SyncSummary> {
   const url = `${API_BASE_URL}${path}`;
+  let shouldBypassInternalRetry = false;
+  const handleEvent = (event: SyncProgressEvent) => {
+    if (shouldHandleRetryAtUiLevel(event)) {
+      shouldBypassInternalRetry = true;
+    }
+    onEvent(event);
+  };
 
   return (async () => {
     for (let attempt = 0; attempt <= SYNC_RETRY_DELAYS_MS.length; attempt += 1) {
       try {
-        return await consumeSyncStream(url, onEvent, signal);
+        return await consumeSyncStream(url, handleEvent, signal);
       } catch (error) {
         if (signal?.aborted) {
           return getAbortedSyncSummary();
@@ -284,7 +295,7 @@ function streamSync(
           ? error
           : new SyncRequestError(getErrorMessage(error, 'The sync request failed.'));
 
-        if (!syncError.retryable || attempt >= SYNC_RETRY_DELAYS_MS.length) {
+        if (!syncError.retryable || shouldBypassInternalRetry || attempt >= SYNC_RETRY_DELAYS_MS.length) {
           throw syncError;
         }
 
