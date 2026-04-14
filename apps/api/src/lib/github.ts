@@ -3,6 +3,7 @@ import {
   isRetryableHttpStatus,
   withDelayedRetry,
 } from './retry.js';
+import { runWithConcurrency } from './concurrency.js';
 
 export interface GitHubStarredRepository {
   id: number;
@@ -51,6 +52,7 @@ export type GitHubReleasesResult =
   | { ok: false; releases: []; error: string };
 
 const STARRED_REPOSITORIES_PAGE_SIZE = 100;
+const STARRED_DISCOVERY_CONCURRENCY = 6;
 
 function decodeGitHubContent(encodedContent: string): string {
   return Buffer.from(encodedContent.replace(/\n/g, ''), 'base64').toString('utf8');
@@ -90,6 +92,33 @@ function parseLastPageFromLinkHeader(linkHeader: string | null): number | null {
 export class GitHubClient {
   constructor(private readonly token: string) {}
 
+  private async fetchStarredRepositoriesPage(page: number): Promise<{
+    repositories: GitHubStarredRepository[];
+    lastPage: number | null;
+  }> {
+    const response = await this.requestResponse(
+      `/user/starred?page=${page}&per_page=${STARRED_REPOSITORIES_PAGE_SIZE}&sort=updated`,
+      {
+        headers: {
+          Accept: 'application/vnd.github.star+json',
+        },
+      },
+    );
+    const pageItems = await response.json() as Array<{ starred_at: string; repo: GitHubStarredRepository } | GitHubStarredRepository>;
+
+    return {
+      repositories: pageItems.map((item) => (
+        'repo' in item && item.repo
+          ? {
+              ...item.repo,
+              starred_at: item.starred_at,
+            }
+          : item as GitHubStarredRepository
+      )),
+      lastPage: parseLastPageFromLinkHeader(response.headers.get('link')),
+    };
+  }
+
   private async requestResponse(path: string, init?: RequestInit): Promise<Response> {
     return withDelayedRetry(async () => {
       const response = await fetch(`https://api.github.com${path}`, {
@@ -127,61 +156,81 @@ export class GitHubClient {
   async fetchStarredRepositories(
     onProgress?: (progress: StarredRepositoryDiscoveryProgress) => void,
   ): Promise<GitHubStarredRepository[]> {
-    const repositories: GitHubStarredRepository[] = [];
-    let page = 1;
+    const firstPage = await this.fetchStarredRepositoriesPage(1);
+    if (firstPage.repositories.length === 0) {
+      return [];
+    }
 
-    while (true) {
-      const response = await this.requestResponse(
-        `/user/starred?page=${page}&per_page=${STARRED_REPOSITORIES_PAGE_SIZE}&sort=updated`,
-        {
-          headers: {
-            Accept: 'application/vnd.github.star+json',
-          },
-        },
-      );
-      const pageItems = await response.json() as Array<{ starred_at: string; repo: GitHubStarredRepository } | GitHubStarredRepository>;
+    if (firstPage.lastPage === null) {
+      const repositories = [...firstPage.repositories];
+      onProgress?.({
+        discoveredCount: repositories.length,
+        estimatedTotalCount: firstPage.repositories.length < STARRED_REPOSITORIES_PAGE_SIZE
+          ? repositories.length
+          : repositories.length + STARRED_REPOSITORIES_PAGE_SIZE,
+      });
 
-      if (pageItems.length === 0) {
-        if (repositories.length > 0) {
+      if (firstPage.repositories.length < STARRED_REPOSITORIES_PAGE_SIZE) {
+        return repositories;
+      }
+
+      let page = 2;
+      while (true) {
+        const nextPage = await this.fetchStarredRepositoriesPage(page);
+        if (nextPage.repositories.length === 0) {
           onProgress?.({
             discoveredCount: repositories.length,
             estimatedTotalCount: repositories.length,
           });
+          break;
         }
-        break;
+
+        repositories.push(...nextPage.repositories);
+        const isLastPage = nextPage.repositories.length < STARRED_REPOSITORIES_PAGE_SIZE;
+        onProgress?.({
+          discoveredCount: repositories.length,
+          estimatedTotalCount: isLastPage ? repositories.length : repositories.length + STARRED_REPOSITORIES_PAGE_SIZE,
+        });
+
+        if (isLastPage) {
+          break;
+        }
+        page += 1;
       }
 
-      for (const item of pageItems) {
-        if ('repo' in item && item.repo) {
-          repositories.push({
-            ...item.repo,
-            starred_at: item.starred_at,
-          });
-        } else {
-          repositories.push(item as GitHubStarredRepository);
-        }
-      }
+      return repositories;
+    }
 
-      const discoveredCount = repositories.length;
-      const lastPage = parseLastPageFromLinkHeader(response.headers.get('link'));
-      const isLastPage = pageItems.length < STARRED_REPOSITORIES_PAGE_SIZE || (lastPage !== null && page >= lastPage);
+    const pages = new Map<number, GitHubStarredRepository[]>([[1, firstPage.repositories]]);
+    let discoveredCount = firstPage.repositories.length;
+    const lastPage = firstPage.lastPage;
+    onProgress?.({
+      discoveredCount,
+      estimatedTotalCount: lastPage === 1 ? discoveredCount : lastPage * STARRED_REPOSITORIES_PAGE_SIZE,
+    });
+
+    if (lastPage === 1) {
+      return firstPage.repositories;
+    }
+
+    const remainingPages = Array.from({ length: lastPage - 1 }, (_, index) => index + 2);
+    let completedPages = 1;
+
+    await runWithConcurrency(remainingPages, STARRED_DISCOVERY_CONCURRENCY, undefined, async (pageNumber) => {
+      const page = await this.fetchStarredRepositoriesPage(pageNumber);
+      pages.set(pageNumber, page.repositories);
+      discoveredCount += page.repositories.length;
+      completedPages += 1;
 
       onProgress?.({
         discoveredCount,
-        estimatedTotalCount: isLastPage
+        estimatedTotalCount: completedPages === lastPage
           ? discoveredCount
-          : lastPage !== null
-            ? lastPage * STARRED_REPOSITORIES_PAGE_SIZE
-            : discoveredCount + STARRED_REPOSITORIES_PAGE_SIZE,
+          : lastPage * STARRED_REPOSITORIES_PAGE_SIZE,
       });
+    });
 
-      if (isLastPage) {
-        break;
-      }
-      page += 1;
-    }
-
-    return repositories;
+    return Array.from({ length: lastPage }, (_, index) => pages.get(index + 1) ?? []).flat();
   }
 
   async fetchReadme(owner: string, repo: string): Promise<string> {

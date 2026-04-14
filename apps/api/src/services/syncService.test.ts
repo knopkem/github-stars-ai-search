@@ -211,7 +211,7 @@ describe('SyncService', () => {
 
     githubState.fetchStarredRepositories.mockResolvedValue([
       createStarredRepository(unchangedExisting),
-      createStarredRepository(changedExisting, { pushed_at: '2024-02-01T00:00:00Z' }),
+      createStarredRepository(changedExisting, { description: 'Repository 2 (updated)' }),
       createStarredRepository(newRepository),
     ]);
     githubState.fetchReleasesResult.mockImplementation(async (_owner: string, repo: string) => {
@@ -257,6 +257,38 @@ describe('SyncService', () => {
     expect(lmStudioState.testConnection).toHaveBeenCalledTimes(1);
   });
 
+  it('does not refresh repositories solely because the upstream pushed_at timestamp changed', async () => {
+    const existingRepository = createRepositoryRecord(1, {
+      summary: 'Current summary',
+      tags: ['stable'],
+      platforms: ['web'],
+      indexedAt: '2024-01-05T00:00:00Z',
+    });
+
+    githubState.fetchStarredRepositories.mockResolvedValue([
+      createStarredRepository(existingRepository, { pushed_at: '2024-02-01T00:00:00Z' }),
+    ]);
+    githubState.fetchReleasesResult.mockResolvedValue({
+      ok: true,
+      releases: [createGitHubRelease(101)],
+    });
+
+    const catalogService = createCatalogService({
+      listRepositories: vi.fn().mockReturnValue([existingRepository]),
+      listReleases: vi.fn().mockReturnValue([createReleaseRecord(1, 101)]),
+    });
+    const settingsService = createSettingsService({ lmStudioConfigured: false });
+
+    const syncService = new SyncService(settingsService, catalogService);
+    const summary = await syncService.syncFullCatalog();
+
+    expect(summary.indexedRepositoryCount).toBe(0);
+    expect(catalogService.markRepositoriesStale).not.toHaveBeenCalled();
+    expect(catalogService.replaceDocumentsAndChunks).not.toHaveBeenCalled();
+    expect(catalogService.updateFacets).not.toHaveBeenCalled();
+    expect(lmStudioState.testConnection).not.toHaveBeenCalled();
+  });
+
   it('skips LM reindex work when every repository is already current', async () => {
     const existingRepository = createRepositoryRecord(1, {
       summary: 'Current summary',
@@ -287,6 +319,94 @@ describe('SyncService', () => {
     expect(catalogService.replaceDocumentsAndChunks).not.toHaveBeenCalled();
     expect(catalogService.updateFacets).not.toHaveBeenCalled();
     expect(lmStudioState.testConnection).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh repositories solely because a GitHub release omits the optional name field', async () => {
+    const existingRepository = createRepositoryRecord(1, {
+      summary: 'Current summary',
+      tags: ['stable'],
+      platforms: ['web'],
+      indexedAt: '2024-01-05T00:00:00Z',
+    });
+
+    githubState.fetchStarredRepositories.mockResolvedValue([
+      createStarredRepository(existingRepository),
+    ]);
+    githubState.fetchReleasesResult.mockResolvedValue({
+      ok: true,
+      releases: [createGitHubRelease(101, { name: undefined })],
+    });
+
+    const catalogService = createCatalogService({
+      listRepositories: vi.fn().mockReturnValue([existingRepository]),
+      listReleases: vi.fn().mockReturnValue([
+        {
+          ...createReleaseRecord(1, 101, existingRepository.fullName),
+          name: 'v101.0.0',
+        },
+      ]),
+    });
+    const settingsService = createSettingsService({ lmStudioConfigured: false });
+
+    const syncService = new SyncService(settingsService, catalogService);
+    const summary = await syncService.syncFullCatalog();
+
+    expect(summary.indexedRepositoryCount).toBe(0);
+    expect(catalogService.markRepositoriesStale).not.toHaveBeenCalled();
+    expect(catalogService.replaceDocumentsAndChunks).not.toHaveBeenCalled();
+    expect(catalogService.updateFacets).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh repositories solely because release asset download counts changed', async () => {
+    const existingRepository = createRepositoryRecord(1, {
+      summary: 'Current summary',
+      tags: ['stable'],
+      platforms: ['web'],
+      indexedAt: '2024-01-05T00:00:00Z',
+    });
+
+    githubState.fetchStarredRepositories.mockResolvedValue([
+      createStarredRepository(existingRepository),
+    ]);
+    githubState.fetchReleasesResult.mockResolvedValue({
+      ok: true,
+      releases: [createGitHubRelease(101, {
+        assets: [{
+          id: 501,
+          name: 'tool.zip',
+          size: 1024,
+          download_count: 99,
+          content_type: 'application/zip',
+          browser_download_url: 'https://example.com/tool.zip',
+        }],
+      })],
+    });
+
+    const catalogService = createCatalogService({
+      listRepositories: vi.fn().mockReturnValue([existingRepository]),
+      listReleases: vi.fn().mockReturnValue([
+        createReleaseRecord(1, 101, existingRepository.fullName),
+      ].map((release) => ({
+        ...release,
+        assets: [{
+          id: 501,
+          name: 'tool.zip',
+          size: 1024,
+          downloadCount: 1,
+          contentType: 'application/zip',
+          browserDownloadUrl: 'https://example.com/tool.zip',
+        }],
+      }))),
+    });
+    const settingsService = createSettingsService({ lmStudioConfigured: false });
+
+    const syncService = new SyncService(settingsService, catalogService);
+    const summary = await syncService.syncFullCatalog();
+
+    expect(summary.indexedRepositoryCount).toBe(0);
+    expect(catalogService.markRepositoriesStale).not.toHaveBeenCalled();
+    expect(catalogService.replaceDocumentsAndChunks).not.toHaveBeenCalled();
+    expect(catalogService.updateFacets).not.toHaveBeenCalled();
   });
 
   it('forces a rebuild for every discovered repository when requested', async () => {
@@ -349,5 +469,49 @@ describe('SyncService', () => {
     expect(summary.indexedRepositoryCount).toBe(1);
     expect(catalogService.markRepositoriesStale).toHaveBeenCalledWith([1]);
     expect(catalogService.replaceDocumentsAndChunks).toHaveBeenCalledWith(1, expect.any(Array), expect.any(Array));
+  });
+
+  it('fetches release metadata with higher concurrency than LM Studio analysis work', async () => {
+    const repositories = [
+      createRepositoryRecord(1, { indexedAt: '2024-01-05T00:00:00Z' }),
+      createRepositoryRecord(2, { indexedAt: '2024-01-05T00:00:00Z' }),
+      createRepositoryRecord(3, { indexedAt: '2024-01-05T00:00:00Z' }),
+    ];
+
+    githubState.fetchStarredRepositories.mockResolvedValue(
+      repositories.map((repository) => createStarredRepository(repository)),
+    );
+
+    let activeFetches = 0;
+    let maxConcurrentFetches = 0;
+    const releaseResolvers: Array<() => void> = [];
+    githubState.fetchReleasesResult.mockImplementation(() => new Promise((resolve) => {
+      activeFetches += 1;
+      maxConcurrentFetches = Math.max(maxConcurrentFetches, activeFetches);
+      releaseResolvers.push(() => {
+        activeFetches -= 1;
+        resolve({ ok: true, releases: [createGitHubRelease(101)] });
+      });
+    }));
+
+    const catalogService = createCatalogService({
+      listRepositories: vi.fn().mockReturnValue(repositories),
+      listReleases: vi.fn().mockReturnValue(repositories.map((repository) => createReleaseRecord(repository.id, 101, repository.fullName))),
+    });
+    const settingsService = createSettingsService({ lmStudioConfigured: false });
+
+    const syncService = new SyncService(settingsService, catalogService);
+    const summaryPromise = syncService.syncFullCatalog();
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(releaseResolvers).toHaveLength(3);
+    expect(maxConcurrentFetches).toBeGreaterThan(1);
+
+    releaseResolvers.forEach((resolve) => resolve());
+
+    const summary = await summaryPromise;
+    expect(summary.indexedRepositoryCount).toBe(0);
+    expect(lmStudioState.testConnection).not.toHaveBeenCalled();
   });
 });

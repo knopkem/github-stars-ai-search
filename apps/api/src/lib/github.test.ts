@@ -109,4 +109,72 @@ describe('GitHubClient', () => {
     expect(repositories).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it('fetches remaining starred repository pages in parallel while preserving page order', async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => createStarredRepository(index + 1));
+    const secondPage = Array.from({ length: 100 }, (_, index) => createStarredRepository(index + 101));
+    const thirdPage = Array.from({ length: 2 }, (_, index) => createStarredRepository(index + 201));
+
+    let resolveSecondPage: ((response: Response) => void) | null = null;
+    let resolveThirdPage: ((response: Response) => void) | null = null;
+    const secondPagePromise = new Promise<Response>((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    const thirdPagePromise = new Promise<Response>((resolve) => {
+      resolveThirdPage = resolve;
+    });
+
+    const fetchMock = vi.fn((input: string | URL | globalThis.Request) => {
+      const url = String(input);
+      const page = new URL(url).searchParams.get('page');
+      if (page === '1') {
+        return Promise.resolve(
+          createJsonResponse(firstPage, {
+            link: [
+              '<https://api.github.com/user/starred?page=2&per_page=100&sort=updated>; rel="next"',
+              '<https://api.github.com/user/starred?page=3&per_page=100&sort=updated>; rel="last"',
+            ].join(', '),
+          }),
+        );
+      }
+      if (page === '2') {
+        return secondPagePromise;
+      }
+      if (page === '3') {
+        return thirdPagePromise;
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const onProgress = vi.fn();
+    const client = new GitHubClient('test-token');
+    const repositoriesPromise = client.fetchStarredRepositories(onProgress);
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    if (!resolveSecondPage || !resolveThirdPage) {
+      throw new Error('Expected deferred starred page resolvers to be initialized.');
+    }
+
+    const resolvePageThree = resolveThirdPage as (response: Response) => void;
+    const resolvePageTwo = resolveSecondPage as (response: Response) => void;
+
+    resolvePageThree(createJsonResponse(thirdPage));
+    resolvePageTwo(createJsonResponse(secondPage));
+
+    const repositories = await repositoriesPromise;
+
+    expect(repositories).toHaveLength(202);
+    expect(repositories[0]?.id).toBe(1);
+    expect(repositories[100]?.id).toBe(101);
+    expect(repositories[200]?.id).toBe(201);
+    expect(onProgress).toHaveBeenCalledWith({
+      discoveredCount: 202,
+      estimatedTotalCount: 202,
+    });
+  });
 });

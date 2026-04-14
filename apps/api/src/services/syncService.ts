@@ -7,6 +7,7 @@ import {
   type UpdateLmStudioSettingsInput,
 } from '@github-stars-ai-search/shared';
 import { chunkDocument, type SourceDocument } from '../lib/chunking.js';
+import { runWithConcurrency } from '../lib/concurrency.js';
 import type { GitHubRelease, GitHubStarredRepository } from '../lib/github.js';
 import { GitHubClient } from '../lib/github.js';
 import { LMStudioClient } from '../lib/lmStudio.js';
@@ -16,6 +17,7 @@ import { SettingsService } from './settingsService.js';
 const HIGH_SIGNAL_FILES = ['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'pom.xml'];
 
 const EMPTY_RELEASE_FINGERPRINT = '[]';
+const GITHUB_METADATA_CONCURRENCY = 6;
 
 interface SyncOptions {
   forceReindex?: boolean;
@@ -95,6 +97,34 @@ function hasMeaningfulRepositoryChange(existingRepository: RepositoryRecord, rep
     || JSON.stringify(normalizedTopics(existingRepository.topics)) !== JSON.stringify(normalizedTopics(repository.topics ?? []));
 }
 
+function normalizeReleaseName(name: string | null | undefined, tagName: string): string {
+  return name ?? tagName;
+}
+
+function fingerprintGitHubReleaseAssets(release: GitHubRelease): Array<[number, string, number, string, string]> {
+  return [...release.assets]
+    .sort((left, right) => left.id - right.id)
+    .map((asset) => [
+      asset.id,
+      asset.name,
+      asset.size,
+      asset.content_type ?? '',
+      asset.browser_download_url,
+    ]);
+}
+
+function fingerprintStoredReleaseAssets(release: ReleaseRecord): Array<[number, string, number, string, string]> {
+  return [...release.assets]
+    .sort((left, right) => left.id - right.id)
+    .map((asset) => [
+      asset.id,
+      asset.name,
+      asset.size,
+      asset.contentType ?? '',
+      asset.browserDownloadUrl,
+    ]);
+}
+
 function fingerprintGitHubReleases(releases: GitHubRelease[]): string {
   return JSON.stringify(
     [...releases]
@@ -102,22 +132,13 @@ function fingerprintGitHubReleases(releases: GitHubRelease[]): string {
       .map((release) => [
         release.id,
         release.tag_name,
-        release.name ?? '',
+        normalizeReleaseName(release.name, release.tag_name),
         release.body ?? '',
         release.published_at ?? '',
         release.html_url,
         release.prerelease ? 1 : 0,
         release.draft ? 1 : 0,
-        [...release.assets]
-          .sort((left, right) => left.id - right.id)
-          .map((asset) => [
-            asset.id,
-            asset.name,
-            asset.size,
-            asset.download_count,
-            asset.content_type ?? '',
-            asset.browser_download_url,
-          ]),
+        fingerprintGitHubReleaseAssets(release),
       ]),
   );
 }
@@ -129,22 +150,13 @@ function fingerprintStoredReleases(releases: ReleaseRecord[]): string {
       .map((release) => [
         release.id,
         release.tagName,
-        release.name,
+        normalizeReleaseName(release.name, release.tagName),
         release.body,
         release.publishedAt ?? '',
         release.htmlUrl,
         release.isPrerelease ? 1 : 0,
         release.isDraft ? 1 : 0,
-        [...release.assets]
-          .sort((left, right) => left.id - right.id)
-          .map((asset) => [
-            asset.id,
-            asset.name,
-            asset.size,
-            asset.downloadCount,
-            asset.contentType ?? '',
-            asset.browserDownloadUrl,
-          ]),
+        fingerprintStoredReleaseAssets(release),
       ]),
   );
 }
@@ -167,47 +179,6 @@ function buildStoredReleaseFingerprintMap(releases: ReleaseRecord[]): Map<number
 
 function formatDiscoveryProgress(discoveredCount: number): string {
   return `${discoveredCount} starred ${discoveredCount === 1 ? 'repository' : 'repositories'} discovered`;
-}
-
-async function runWithConcurrency<T>(
-  items: readonly T[],
-  concurrency: number,
-  signal: AbortSignal | undefined,
-  worker: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  if (items.length === 0) {
-    return;
-  }
-
-  const workerCount = Math.max(1, Math.min(concurrency, items.length));
-  if (workerCount <= 1) {
-    for (let index = 0; index < items.length; index += 1) {
-      if (signal?.aborted) {
-        break;
-      }
-      const item = items[index];
-      if (item !== undefined) {
-        await worker(item, index);
-      }
-    }
-    return;
-  }
-
-  let nextIndex = 0;
-  const runWorker = async (): Promise<void> => {
-    while (nextIndex < items.length) {
-      if (signal?.aborted) {
-        break;
-      }
-      const index = nextIndex++;
-      const item = items[index];
-      if (item !== undefined) {
-        await worker(item, index);
-      }
-    }
-  };
-
-  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 }
 
 function inferFacetsFallback(repository: RepositoryRecord): { summary: string; tags: string[]; platforms: string[] } {
@@ -448,7 +419,7 @@ export class SyncService {
   async syncFullCatalog(callbacks?: SyncCallbacks, options?: SyncOptions): Promise<SyncSummary> {
     const token = this.settingsService.getGitHubToken();
     const githubClient = new GitHubClient(token);
-    const concurrency = this.settingsService.getPublicSettings().lmStudio?.concurrency ?? 1;
+    const analysisConcurrency = this.settingsService.getPublicSettings().lmStudio?.concurrency ?? 1;
     const forceReindex = options?.forceReindex === true;
 
     const repositories = await githubClient.fetchStarredRepositories(({ discoveredCount, estimatedTotalCount }) => {
@@ -467,7 +438,7 @@ export class SyncService {
     const existingReleaseFingerprints = buildStoredReleaseFingerprintMap(this.catalogService.listReleases(false));
     const refreshCandidates: RepositoryRefreshCandidate[] = [];
 
-    await runWithConcurrency(repositories, concurrency, callbacks?.signal, async (repository, repoIndex) => {
+    await runWithConcurrency(repositories, GITHUB_METADATA_CONCURRENCY, callbacks?.signal, async (repository, repoIndex) => {
       try {
         callbacks?.onProgress?.(repoIndex + 1, repositories.length, repository.full_name, 'fetching');
 
@@ -479,7 +450,6 @@ export class SyncService {
           || !existingRepository
           || existingRepository.indexedAt === null
           || existingRepository.needsRefresh
-          || existingRepository.pushedAt !== (repository.pushed_at ?? null)
           || (existingRepository !== null && hasMeaningfulRepositoryChange(existingRepository, repository));
 
         const releasesResult = await githubClient.fetchReleasesResult(repository.owner.login, repository.name);
@@ -525,7 +495,7 @@ export class SyncService {
       const lmStudioClient = new LMStudioClient(lmStudioConfig);
       await lmStudioClient.testConnection();
 
-      await runWithConcurrency(repositoriesToRefresh, concurrency, callbacks?.signal, async (candidate, refreshIndex) => {
+      await runWithConcurrency(repositoriesToRefresh, analysisConcurrency, callbacks?.signal, async (candidate, refreshIndex) => {
         try {
           callbacks?.onProgress?.(refreshIndex + 1, repositoriesToRefresh.length, candidate.repository.full_name, 'fetching');
           const result = await this.indexRepository(
